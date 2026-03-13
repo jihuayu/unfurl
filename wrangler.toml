@@ -1,0 +1,15 @@
+name = "unfurl"
+main = "src/index.ts"
+compatibility_date = "2024-05-12"
+
+[placement]
+mode = "smart"
+
+[[routes]]
+pattern = "og-proxy.raw2.cc"
+custom_domain = true
+
+[[kv_namespaces]]
+binding = "UNFURL_CACHE"
+id = "0e7b6deb6ad14d268dddaa38625dd5bc"
+preview_id = "206ed6890270417d9c196b000dc60864"
