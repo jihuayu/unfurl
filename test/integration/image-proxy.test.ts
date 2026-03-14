@@ -20,9 +20,10 @@ describe("GET /proxy/image", () => {
     vi.stubGlobal("fetch", fetchSpy as unknown as typeof fetch);
 
     const response = await worker.fetch(
-      new Request("https://service.example/proxy/image?url=https://cdn.example.com/cover.png&w=200", {
+      new Request("https://service.example/proxy/image?url=https://cdn.example.com/cover.png&w=200&referer=https%3A%2F%2Fexample.com%2Fpost%3Fcase%3Dfirst", {
         headers: {
-          accept: "image/avif,image/webp,image/*"
+          accept: "image/avif,image/webp,image/*",
+          referer: "https://attacker.example/fake"
         }
       }),
       env,
@@ -38,6 +39,11 @@ describe("GET /proxy/image", () => {
     };
     expect(requestInit.cf?.image?.format).toBe("avif");
     expect(requestInit.cf?.image?.width).toBe(200);
+    const requestHeaders = requestInit.headers as HeadersInit | undefined;
+    const forwardedReferer = requestHeaders instanceof Headers
+      ? requestHeaders.get("referer")
+      : (requestHeaders as Record<string, string> | undefined)?.referer;
+    expect(forwardedReferer).toBe("https://example.com/post?case=first");
   });
 
   it("falls back to simple proxy when cf-resized header is absent", async () => {
@@ -84,3 +90,4 @@ describe("GET /proxy/image", () => {
     expect(json.error.code).toBe("UNSUPPORTED_MEDIA_TYPE");
   });
 });
+

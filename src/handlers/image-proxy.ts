@@ -34,6 +34,8 @@ export async function handleImageProxy(
   }
 
   const targetUrl = validatePublicUrl(rawTargetUrl).toString();
+  const rawReferer = requestUrl.searchParams.get("referer");
+  const referer = rawReferer ? validatePublicUrl(rawReferer).toString() : undefined;
   const width = parseOptionalNumberParam("w", requestUrl.searchParams.get("w"), { min: 1, max: 4096 });
   const height = parseOptionalNumberParam("h", requestUrl.searchParams.get("h"), { min: 1, max: 4096 });
   const quality = parseNumberParam("q", requestUrl.searchParams.get("q"), {
@@ -53,10 +55,13 @@ export async function handleImageProxy(
     height
   };
 
+  const upstreamHeaders: HeadersInit = {
+    accept: "image/avif,image/webp,image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5",
+    ...(referer ? { referer } : {})
+  };
+
   const upstreamResponse = await fetchImpl(targetUrl, {
-    headers: {
-      accept: "image/avif,image/webp,image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5"
-    },
+    headers: upstreamHeaders,
     cf: {
       cacheEverything: true,
       cacheTtl: DEFAULT_IMAGE_TTL,
@@ -81,3 +86,4 @@ export async function handleImageProxy(
     headers
   });
 }
+

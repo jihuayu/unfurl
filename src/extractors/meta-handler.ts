@@ -1,5 +1,5 @@
 import type { RawHeadMetadata } from "../types";
-import { HeadParsedSignal, sanitizeText } from "../utils";
+import { sanitizeText } from "../utils";
 
 function appendMetaValue(metadata: RawHeadMetadata, key: string, value: string): void {
   const normalizedKey = key.toLowerCase();
@@ -68,12 +68,6 @@ class TitleHandler {
   }
 }
 
-class BodyHandler {
-  element(): never {
-    throw new HeadParsedSignal();
-  }
-}
-
 export function createEmptyMetadata(): RawHeadMetadata {
   return {
     titleChunks: [],
@@ -93,16 +87,9 @@ export async function extractHeadMetadata(response: Response): Promise<RawHeadMe
     .on("meta", new MetaHandler(metadata))
     .on("link", new LinkHandler(metadata))
     .on("title", new TitleHandler(metadata))
-    .on("body", new BodyHandler())
     .transform(response);
 
-  try {
-    await transformed.arrayBuffer();
-  } catch (error) {
-    if (!(error instanceof HeadParsedSignal)) {
-      throw error;
-    }
-  }
+  await transformed.arrayBuffer();
 
   return metadata;
 }

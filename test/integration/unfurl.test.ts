@@ -32,6 +32,8 @@ describe("GET /api", () => {
     expect(firstJson.status).toBe("success");
     expect(firstJson.headers["x-cache-status"]).toBe("MISS");
     expect(firstJson.data.image.proxy).toContain("/proxy/image?url=");
+    expect(firstJson.data.image.proxy).toContain("referer=");
+    expect(firstJson.data.image.proxy).toContain(encodeURIComponent("https://example.com/post?case=first"));
     expect(originFetch).toHaveBeenCalledTimes(1);
 
     const secondResponse = await worker.fetch(
@@ -89,3 +91,4 @@ describe("GET /api", () => {
     expect(json.error.code).toBe("PRIVATE_IP");
   });
 });
+

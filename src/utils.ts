@@ -261,9 +261,9 @@ export function chooseImageFormat(acceptHeader: string | null, requestedFormat: 
   return "jpeg";
 }
 
-export function buildImageProxyUrl(requestUrl: string, assetUrl: string): string {
+export function buildImageProxyUrl(requestUrl: string, assetUrl: string, refererUrl: string): string {
   const baseUrl = new URL(requestUrl);
-  return `${baseUrl.origin}/proxy/image?url=${encodeURIComponent(assetUrl)}`;
+  return `${baseUrl.origin}/proxy/image?url=${encodeURIComponent(assetUrl)}&referer=${encodeURIComponent(refererUrl)}`;
 }
 
 export function ensureImageContentType(contentType: string | null): void {
@@ -271,3 +271,4 @@ export function ensureImageContentType(contentType: string | null): void {
     throw new AppError(415, "UNSUPPORTED_MEDIA_TYPE", "Origin did not return an image payload");
   }
 }
+

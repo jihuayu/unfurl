@@ -56,10 +56,10 @@ export async function handleUnfurl(
   const data = mergeMetaTags(metadata, targetUrl);
 
   if (data.image) {
-    data.image.proxy = buildImageProxyUrl(request.url, data.image.url);
+    data.image.proxy = buildImageProxyUrl(request.url, data.image.url, targetUrl);
   }
   if (data.logo) {
-    data.logo.proxy = buildImageProxyUrl(request.url, data.logo.url);
+    data.logo.proxy = buildImageProxyUrl(request.url, data.logo.url, targetUrl);
   }
 
   await writeUnfurlCache(env, cacheKey, data, ttl, ctx);
