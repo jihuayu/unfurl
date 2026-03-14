@@ -33,7 +33,7 @@ describe("GET /proxy/image", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toBe("image/avif");
     expect(response.headers.get("x-image-optimized")).toBe("1");
-    expect(response.headers.get("cache-control")).toContain("immutable");
+    expect(response.headers.get("cache-control")).toBe("public, max-age=86400, immutable");
     const requestInit = fetchSpy.mock.calls[0]?.[1] as RequestInit & {
       cf?: { image?: { format?: string; width?: number } };
     };
@@ -44,6 +44,7 @@ describe("GET /proxy/image", () => {
       ? requestHeaders.get("referer")
       : (requestHeaders as Record<string, string> | undefined)?.referer;
     expect(forwardedReferer).toBe("https://example.com/post?case=first");
+    expect(requestInit.cf?.cacheTtl).toBe(86400);
   });
 
   it("falls back to simple proxy when cf-resized header is absent", async () => {
@@ -88,6 +89,32 @@ describe("GET /proxy/image", () => {
     expect(response.status).toBe(415);
     const json = await response.json<{ error: { code: string } }>();
     expect(json.error.code).toBe("UNSUPPORTED_MEDIA_TYPE");
+  });
+
+  it("uses environment overrides for image cache ttl", async () => {
+    const env = createEnv({
+      IMAGE_CACHE_TTL: "172800"
+    });
+    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response("raw-image", {
+        headers: {
+          "content-type": "image/png"
+        }
+      })
+    );
+    vi.stubGlobal("fetch", fetchSpy as unknown as typeof fetch);
+
+    const response = await worker.fetch(
+      new Request("https://service.example/proxy/image?url=https://cdn.example.com/raw.png"),
+      env,
+      createExecutionContext()
+    );
+
+    expect(response.headers.get("cache-control")).toBe("public, max-age=172800, immutable");
+    const requestInit = fetchSpy.mock.calls[0]?.[1] as RequestInit & {
+      cf?: { cacheTtl?: number };
+    };
+    expect(requestInit.cf?.cacheTtl).toBe(172800);
   });
 });
 

@@ -1,5 +1,8 @@
 export interface Env {
   UNFURL_CACHE: KVNamespace;
+  API_RESPONSE_CACHE_TTL?: string;
+  IMAGE_CACHE_TTL?: string;
+  OG_CACHE_TTL?: string;
 }
 
 export type CacheStatus = "HIT" | "MISS";

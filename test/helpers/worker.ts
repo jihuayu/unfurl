@@ -42,9 +42,10 @@ class MockKV {
   }
 }
 
-export function createEnv(): Env {
+export function createEnv(overrides: Partial<Env> = {}): Env {
   return {
-    UNFURL_CACHE: new MockKV() as unknown as KVNamespace
+    UNFURL_CACHE: new MockKV() as unknown as KVNamespace,
+    ...overrides
   };
 }
 

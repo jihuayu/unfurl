@@ -1,4 +1,4 @@
-import type { ApiErrorResponse, ApiSuccessResponse, ImageFit, ImageFormat, ResponseHeadersShape, UnfurlData } from "./types";
+import type { ApiErrorResponse, ApiSuccessResponse, Env, ImageFit, ImageFormat, ResponseHeadersShape, UnfurlData } from "./types";
 
 const LOCAL_SUFFIXES = [".local", ".internal", ".localhost"];
 const PRIVATE_IPV4_PATTERNS = [
@@ -9,8 +9,9 @@ const PRIVATE_IPV4_PATTERNS = [
   /^172\.(1[6-9]|2\d|3[0-1])\./
 ];
 
-export const DEFAULT_API_TTL = 3600;
-export const DEFAULT_IMAGE_TTL = 86400;
+export const DEFAULT_API_RESPONSE_CACHE_TTL = 3600;
+export const DEFAULT_IMAGE_CACHE_TTL = 86400;
+export const DEFAULT_OG_CACHE_TTL = 43200;
 export const DEFAULT_FETCH_TIMEOUT_MS = 8000;
 export const DEFAULT_IMAGE_QUALITY = 80;
 export const DEFAULT_IMAGE_FIT: ImageFit = "scale-down";
@@ -47,6 +48,7 @@ export function createSuccessResponse(
   data: UnfurlData,
   cacheStatus: "HIT" | "MISS",
   startedAt: number,
+  responseCacheTtl: number,
   extraHeaders?: HeadersInit
 ): Response {
   const responseHeaders: ResponseHeadersShape = {
@@ -61,7 +63,7 @@ export function createSuccessResponse(
   };
 
   return jsonResponse(payload, 200, {
-    "cache-control": "public, max-age=60",
+    "cache-control": `public, max-age=${responseCacheTtl}`,
     ...responseHeaders,
     ...extraHeaders
   });
@@ -146,6 +148,27 @@ export function parseNumberParam(
     throw new AppError(400, "INVALID_NUMBER", `${name} must be <= ${options.max}`);
   }
   return parsed;
+}
+
+function parseEnvTtl(value: string | undefined, fallback: number): number {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export function getApiResponseCacheTtl(env: Env): number {
+  return parseEnvTtl(env.API_RESPONSE_CACHE_TTL, DEFAULT_API_RESPONSE_CACHE_TTL);
+}
+
+export function getImageCacheTtl(env: Env): number {
+  return parseEnvTtl(env.IMAGE_CACHE_TTL, DEFAULT_IMAGE_CACHE_TTL);
+}
+
+export function getOgCacheTtl(env: Env): number {
+  return parseEnvTtl(env.OG_CACHE_TTL, DEFAULT_OG_CACHE_TTL);
 }
 
 export function parseOptionalNumberParam(
@@ -271,4 +294,3 @@ export function ensureImageContentType(contentType: string | null): void {
     throw new AppError(415, "UNSUPPORTED_MEDIA_TYPE", "Origin did not return an image payload");
   }
 }
-

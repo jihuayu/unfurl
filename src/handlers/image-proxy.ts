@@ -3,9 +3,9 @@ import {
   AppError,
   DEFAULT_IMAGE_FIT,
   DEFAULT_IMAGE_QUALITY,
-  DEFAULT_IMAGE_TTL,
   chooseImageFormat,
   ensureImageContentType,
+  getImageCacheTtl,
   parseImageFit,
   parseImageFormat,
   parseNumberParam,
@@ -47,6 +47,7 @@ export async function handleImageProxy(
   const fit = parseImageFit(requestUrl.searchParams.get("fit") ?? DEFAULT_IMAGE_FIT);
   const fetchImpl = options.fetchImpl ?? fetch;
   const format = chooseImageFormat(request.headers.get("accept"), requestedFormat);
+  const imageCacheTtl = getImageCacheTtl(_env);
   const imageOptions: CloudflareImageOptions = {
     fit,
     format,
@@ -64,7 +65,7 @@ export async function handleImageProxy(
     headers: upstreamHeaders,
     cf: {
       cacheEverything: true,
-      cacheTtl: DEFAULT_IMAGE_TTL,
+      cacheTtl: imageCacheTtl,
       image: imageOptions
     }
   } as RequestInit & { cf: { cacheEverything: boolean; cacheTtl: number; image: CloudflareImageOptions } });
@@ -76,7 +77,7 @@ export async function handleImageProxy(
   ensureImageContentType(upstreamResponse.headers.get("content-type"));
 
   const headers = new Headers(upstreamResponse.headers);
-  headers.set("cache-control", `public, max-age=${DEFAULT_IMAGE_TTL}, immutable`);
+  headers.set("cache-control", `public, max-age=${imageCacheTtl}, immutable`);
   headers.set("vary", "Accept");
   headers.set("x-image-optimized", upstreamResponse.headers.has("cf-resized") ? "1" : "0");
 

@@ -4,7 +4,7 @@ import { extractHeadMetadata } from "../extractors/meta-handler";
 import { mergeMetaTags } from "../extractors/meta-tags";
 import { fetchPage } from "../fetcher/fetch-page";
 import type { Env } from "../types";
-import { AppError, DEFAULT_API_TTL, buildImageProxyUrl, createSuccessResponse, parseBooleanParam, parseNumberParam, validatePublicUrl } from "../utils";
+import { AppError, buildImageProxyUrl, createSuccessResponse, getApiResponseCacheTtl, getOgCacheTtl, parseBooleanParam, parseNumberParam, validatePublicUrl } from "../utils";
 
 export async function handleUnfurl(
   request: Request,
@@ -23,7 +23,7 @@ export async function handleUnfurl(
   const ttl = parseNumberParam("ttl", requestUrl.searchParams.get("ttl"), {
     min: 60,
     max: 604800,
-    defaultValue: DEFAULT_API_TTL
+    defaultValue: getOgCacheTtl(env)
   });
 
   const normalizedTargetUrl = normalizeTargetUrl(rawTargetUrl);
@@ -32,7 +32,7 @@ export async function handleUnfurl(
   if (!force) {
     const cached = await readUnfurlCache(env, cacheKey, ctx);
     if (cached.value) {
-      return createSuccessResponse(cached.value.data, "HIT", startedAt, {
+      return createSuccessResponse(cached.value.data, "HIT", startedAt, getApiResponseCacheTtl(env), {
         "x-cache-source": cached.source ?? "unknown"
       });
     }
@@ -63,7 +63,7 @@ export async function handleUnfurl(
   }
 
   await writeUnfurlCache(env, cacheKey, data, ttl, ctx);
-  return createSuccessResponse(data, "MISS", startedAt, {
+  return createSuccessResponse(data, "MISS", startedAt, getApiResponseCacheTtl(env), {
     "x-cache-source": "origin"
   });
 }
