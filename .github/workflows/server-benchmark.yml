@@ -6,11 +6,11 @@ on:
       bench_cache_sizes:
         description: Comma-separated cache sizes for the benchmark filter
         required: false
-        default: "200"
+        default: "50,200,1000"
       bench_concurrencies:
         description: Comma-separated concurrency levels for the benchmark filter
         required: false
-        default: "10,50"
+        default: "10,50,200"
       bench_hit_modes:
         description: Comma-separated hit modes for the benchmark filter
         required: false
@@ -22,7 +22,11 @@ on:
       bench_image_backends:
         description: Comma-separated image cache backends for the benchmark filter
         required: false
-        default: "sqlite"
+        default: "sqlite,s3"
+      run_lifecycle_bench:
+        description: Run the long lifecycle benchmark job
+        required: false
+        default: "false"
   pull_request:
     paths:
       - ".github/workflows/server-benchmark.yml"
@@ -36,15 +40,75 @@ permissions:
   contents: read
 
 jobs:
-  benchmark:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      bench_hit_modes: ${{ steps.defaults.outputs.bench_hit_modes }}
+      bench_endpoints: ${{ steps.defaults.outputs.bench_endpoints }}
+      bench_image_backends: ${{ steps.defaults.outputs.bench_image_backends }}
+    steps:
+      - name: Compute benchmark matrix
+        id: matrix
+        shell: bash
+        env:
+          BENCH_CACHE_SIZES_INPUT: ${{ github.event.inputs.bench_cache_sizes || '50,200,1000' }}
+          BENCH_CONCURRENCIES_INPUT: ${{ github.event.inputs.bench_concurrencies || '10,50,200' }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          cache_sizes = [item.strip() for item in os.environ["BENCH_CACHE_SIZES_INPUT"].split(",") if item.strip()]
+          concurrencies = [item.strip() for item in os.environ["BENCH_CONCURRENCIES_INPUT"].split(",") if item.strip()]
+
+          include = []
+          for cache_size in cache_sizes:
+              for concurrency in concurrencies:
+                  include.append({
+                      "cache_size": cache_size,
+                      "concurrency": concurrency,
+                      "artifact_suffix": f"cache{cache_size}-conc{concurrency}",
+                  })
+
+          print(f"matrix={json.dumps({'include': include})}")
+          PY
+
+      - name: Resolve shared filters
+        id: defaults
+        shell: bash
+        env:
+          BENCH_HIT_MODES_INPUT: ${{ github.event.inputs.bench_hit_modes || 'mixed_80_20' }}
+          BENCH_ENDPOINTS_INPUT: ${{ github.event.inputs.bench_endpoints || 'api,image' }}
+          BENCH_IMAGE_BACKENDS_INPUT: ${{ github.event.inputs.bench_image_backends || 'sqlite,s3' }}
+        run: |
+          {
+            echo "bench_hit_modes=${BENCH_HIT_MODES_INPUT}"
+            echo "bench_endpoints=${BENCH_ENDPOINTS_INPUT}"
+            echo "bench_image_backends=${BENCH_IMAGE_BACKENDS_INPUT}"
+          } >> "$GITHUB_OUTPUT"
+
+  benchmark:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     env:
-      BENCH_CACHE_SIZES: ${{ github.event.inputs.bench_cache_sizes || '200' }}
-      BENCH_CONCURRENCIES: ${{ github.event.inputs.bench_concurrencies || '10,50' }}
-      BENCH_HIT_MODES: ${{ github.event.inputs.bench_hit_modes || 'mixed_80_20' }}
-      BENCH_ENDPOINTS: ${{ github.event.inputs.bench_endpoints || 'api,image' }}
-      BENCH_IMAGE_BACKENDS: ${{ github.event.inputs.bench_image_backends || 'sqlite' }}
+      BENCH_CACHE_SIZES: ${{ matrix.cache_size }}
+      BENCH_CONCURRENCIES: ${{ matrix.concurrency }}
+      BENCH_HIT_MODES: ${{ needs.plan.outputs.bench_hit_modes }}
+      BENCH_ENDPOINTS: ${{ needs.plan.outputs.bench_endpoints }}
+      BENCH_IMAGE_BACKENDS: ${{ needs.plan.outputs.bench_image_backends }}
+      BENCH_S3_ENDPOINT: http://127.0.0.1:9000
+      BENCH_S3_REGION: us-east-1
+      BENCH_S3_BUCKET: unfurl-benchmark
+      BENCH_S3_ACCESS_KEY_ID: minioadmin
+      BENCH_S3_SECRET_ACCESS_KEY: minioadmin
+      BENCH_S3_PUBLIC_BASE_URL: http://127.0.0.1:9000/unfurl-benchmark
+      BENCH_S3_FORCE_PATH_STYLE: "true"
+      BENCH_S3_PREFIX: gha-${{ matrix.artifact_suffix }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -58,9 +122,66 @@ jobs:
           workspaces: |
             server -> target
 
-      - name: Run server benchmark
+      - name: Start MinIO container
+        shell: bash
+        run: |
+          docker run -d \
+            --name benchmark-minio \
+            -p 9000:9000 \
+            -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data --console-address ":9001"
+
+      - name: Wait for MinIO
+        shell: bash
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO did not become healthy in time" >&2
+          exit 1
+
+      - name: Run server benchmark shard
         working-directory: server
         run: cargo run --release --bin benchmark
+
+      - name: Upload shard artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-benchmark-${{ matrix.artifact_suffix }}
+          path: |
+            server/benchmark-results.json
+
+      - name: Stop MinIO container
+        if: always()
+        shell: bash
+        run: docker rm -f benchmark-minio || true
+
+  aggregate:
+    needs: benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download benchmark artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: server-benchmark-*
+          path: server/artifacts
+          merge-multiple: false
+
+      - name: Merge benchmark reports
+        shell: bash
+        run: |
+          mapfile -t inputs < <(find server/artifacts -type f -name 'benchmark-results.json' | sort)
+          python3 server/scripts/merge_benchmark_reports.py \
+            --inputs "${inputs[@]}" \
+            --output server/benchmark-results.json
 
       - name: Render benchmark report
         run: python3 server/scripts/render_benchmark_report.py --input server/benchmark-results.json --output server/benchmark-report.md
@@ -69,10 +190,70 @@ jobs:
         shell: bash
         run: cat server/benchmark-report.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload benchmark artifacts
+      - name: Upload merged benchmark artifacts
         uses: actions/upload-artifact@v4
         with:
           name: server-benchmark-report
           path: |
             server/benchmark-results.json
             server/benchmark-report.md
+
+  lifecycle-benchmark:
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.run_lifecycle_bench || 'false') == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            server -> target
+
+      - name: Run lifecycle benchmark
+        working-directory: server
+        run: cargo run --release --bin lifecycle_bench
+
+      - name: Publish lifecycle benchmark summary
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("server/lifecycle-bench-results.json").read_text(encoding="utf-8"))
+          print("# Lifecycle Benchmark Report")
+          print()
+          print(f"- Generated at: `{report.get('generated_at', 'unknown')}`")
+          print(f"- Phase duration: `{report.get('phase_duration_secs', 0)}` seconds")
+          print(f"- Cache size: `{report.get('cache_size', 0)}`")
+          print()
+          print("| Memory Mode | Phase | Avg RPS | Avg Lat (ms) | P99 Lat (ms) | Peak Mem (MB) | Peak CPU (%) | Success Ratio |")
+          print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+          for mode in report.get("results", []):
+              mode_name = mode.get("memory_mode", "")
+              for phase in mode.get("phases", []):
+                  resources = phase.get("resources", {})
+                  latency = phase.get("latency", {})
+                  print(
+                      f"| {mode_name} | {phase.get('phase', '')} | "
+                      f"{phase.get('avg_rps', 0.0):.2f} | "
+                      f"{latency.get('avg_ms', 0.0):.2f} | "
+                      f"{latency.get('p99_ms', 0.0):.2f} | "
+                      f"{resources.get('peak_memory_mb', 0.0):.2f} | "
+                      f"{resources.get('peak_cpu_percent', 0.0):.2f} | "
+                      f"{phase.get('success_ratio', 0.0):.4f} |"
+                  )
+          PY
+
+      - name: Upload lifecycle benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lifecycle-benchmark-report
+          path: |
+            server/lifecycle-bench-results.json
