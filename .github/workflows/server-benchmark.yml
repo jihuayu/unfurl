@@ -1,0 +1,78 @@
+name: Server Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      bench_cache_sizes:
+        description: Comma-separated cache sizes for the benchmark filter
+        required: false
+        default: "200"
+      bench_concurrencies:
+        description: Comma-separated concurrency levels for the benchmark filter
+        required: false
+        default: "10,50"
+      bench_hit_modes:
+        description: Comma-separated hit modes for the benchmark filter
+        required: false
+        default: "mixed_80_20"
+      bench_endpoints:
+        description: Comma-separated endpoints for the benchmark filter
+        required: false
+        default: "api,image"
+      bench_image_backends:
+        description: Comma-separated image cache backends for the benchmark filter
+        required: false
+        default: "sqlite"
+  pull_request:
+    paths:
+      - ".github/workflows/server-benchmark.yml"
+      - "server/**"
+  push:
+    paths:
+      - ".github/workflows/server-benchmark.yml"
+      - "server/**"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BENCH_CACHE_SIZES: ${{ github.event.inputs.bench_cache_sizes || '200' }}
+      BENCH_CONCURRENCIES: ${{ github.event.inputs.bench_concurrencies || '10,50' }}
+      BENCH_HIT_MODES: ${{ github.event.inputs.bench_hit_modes || 'mixed_80_20' }}
+      BENCH_ENDPOINTS: ${{ github.event.inputs.bench_endpoints || 'api,image' }}
+      BENCH_IMAGE_BACKENDS: ${{ github.event.inputs.bench_image_backends || 'sqlite' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            server -> target
+
+      - name: Run server benchmark
+        working-directory: server
+        run: cargo run --release --bin benchmark
+
+      - name: Render benchmark report
+        run: python3 server/scripts/render_benchmark_report.py --input server/benchmark-results.json --output server/benchmark-report.md
+
+      - name: Publish benchmark summary
+        shell: bash
+        run: cat server/benchmark-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-benchmark-report
+          path: |
+            server/benchmark-results.json
+            server/benchmark-report.md

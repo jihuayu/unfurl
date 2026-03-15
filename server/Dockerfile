@@ -14,6 +14,7 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY --from=builder /app/target/release/unfurl-server /usr/local/bin/unfurl-server
+COPY --from=builder /app/target/release/image_worker /usr/local/bin/image_worker
 RUN mkdir -p /data
 
 ENV HOST=0.0.0.0 \

@@ -23,7 +23,14 @@ pub trait CacheStore: Send + Sync {
 
 pub async fn build_cache(config: &Config) -> Result<Arc<dyn CacheStore>, AppError> {
     match config.cache_backend {
-        CacheBackend::Sqlite => Ok(Arc::new(SqliteCache::new(&config.sqlite_path).await?)),
+        CacheBackend::Sqlite => Ok(Arc::new(
+            SqliteCache::new(
+                &config.sqlite_path,
+                config.sqlite_meta_max_connections,
+                config.sqlite_idle_timeout_secs,
+            )
+            .await?,
+        )),
         CacheBackend::Redis => {
             let client =
                 redis::Client::open(config.redis_url.clone().expect("redis url validated"))?;
@@ -37,7 +44,11 @@ pub struct SqliteCache {
 }
 
 impl SqliteCache {
-    async fn new(path: &Path) -> Result<Self, AppError> {
+    async fn new(
+        path: &Path,
+        max_connections: u32,
+        idle_timeout_secs: u64,
+    ) -> Result<Self, AppError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -59,7 +70,11 @@ impl SqliteCache {
         .busy_timeout(std::time::Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(max_connections.max(1))
+            .min_connections(0)
+            .idle_timeout(Some(std::time::Duration::from_secs(
+                idle_timeout_secs.max(1),
+            )))
             .connect_with(options)
             .await?;
 

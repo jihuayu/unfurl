@@ -28,7 +28,8 @@ pub fn process_image(
             bytes: bytes.to_vec(),
             content_type: content_type_for_format(
                 source_format.as_ref().unwrap_or(&request.format),
-            ),
+            )
+            .to_string(),
             optimized: false,
         });
     }
@@ -57,7 +58,7 @@ pub fn process_image(
     let encoded = encode_image(image, &format, request.quality)?;
     Ok(ProcessedImage {
         bytes: encoded,
-        content_type: content_type_for_format(&format),
+        content_type: content_type_for_format(&format).to_string(),
         optimized: source_format != format || needs_resize,
     })
 }

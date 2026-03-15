@@ -1,7 +1,10 @@
 use unfurl_server::{
     extract::{extract_head_metadata, merge_meta_tags},
-    models::ImageFormat,
-    utils::{build_unfurl_cache_key, choose_image_format},
+    models::{ImageFit, ImageFormat, ImageRequest},
+    utils::{
+        build_processed_image_cache_key, build_processed_image_object_key, build_unfurl_cache_key,
+        choose_image_format,
+    },
 };
 
 #[test]
@@ -43,4 +46,43 @@ fn metadata_parser_ignores_body_meta() {
     let data = merge_meta_tags(&metadata, "https://example.com/post");
     assert_eq!(data.title.as_deref(), Some("Head Title"));
     assert_eq!(data.lang.as_deref(), Some("zh-CN"));
+}
+
+#[test]
+fn processed_image_cache_key_changes_with_request_signature() {
+    let first = build_processed_image_cache_key(
+        "https://cdn.example.com/cover.png",
+        Some("https://example.com/post"),
+        &ImageRequest {
+            width: Some(1200),
+            height: Some(630),
+            quality: 80,
+            format: ImageFormat::Avif,
+            fit: ImageFit::Cover,
+        },
+    );
+    let second = build_processed_image_cache_key(
+        "https://cdn.example.com/cover.png",
+        Some("https://example.com/post"),
+        &ImageRequest {
+            width: Some(1200),
+            height: Some(630),
+            quality: 90,
+            format: ImageFormat::Avif,
+            fit: ImageFit::Cover,
+        },
+    );
+
+    assert_ne!(first, second);
+}
+
+#[test]
+fn processed_image_object_key_uses_expected_extension() {
+    let object_key = build_processed_image_object_key(
+        "image-cache",
+        "image:v1:abcdef123456",
+        &ImageFormat::Webp,
+    );
+
+    assert_eq!(object_key, "image-cache/v1/ab/abcdef123456.webp");
 }

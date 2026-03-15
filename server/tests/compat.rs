@@ -1,11 +1,13 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
+use async_trait::async_trait;
 use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
 use tempfile::TempDir;
+use tokio::sync::Semaphore;
 use tower::ServiceExt;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -14,20 +16,43 @@ use wiremock::{
 
 use unfurl_server::{
     build_app_with_client,
-    config::{CacheBackend, Config},
+    cache::CacheStore,
+    config::{CacheBackend, Config, ImageCacheBackend},
+    image_cache::ImageCacheStore,
+    models::{CacheEnvelope, ImageCacheHit, ImageCacheWrite, UnfurlData},
+    router_with_state,
+    state::AppState,
 };
 
 fn test_config(sqlite_path: PathBuf) -> Config {
     Config {
         host: "127.0.0.1".to_string(),
         port: 0,
+        low_memory_mode: false,
         api_response_cache_ttl: 3600,
         image_cache_ttl: 86400,
         og_cache_ttl: 43200,
         fetch_timeout_ms: 8000,
+        api_miss_max_concurrency: 8,
+        image_miss_max_concurrency: 1,
+        http_pool_max_idle_per_host: 8,
+        http_pool_idle_timeout_secs: 90,
+        sqlite_meta_max_connections: 5,
+        sqlite_image_max_connections: 5,
+        sqlite_idle_timeout_secs: 300,
         cache_backend: CacheBackend::Sqlite,
+        image_cache_backend: ImageCacheBackend::Sqlite,
         sqlite_path,
+        image_worker_bin: None,
         redis_url: None,
+        s3_endpoint: None,
+        s3_region: "us-east-1".to_string(),
+        s3_bucket: None,
+        s3_access_key_id: None,
+        s3_secret_access_key: None,
+        s3_public_base_url: None,
+        s3_force_path_style: false,
+        s3_prefix: "image-cache".to_string(),
     }
 }
 
@@ -118,6 +143,14 @@ async fn api_returns_metadata_then_hits_cache() {
 
     assert_eq!(first_status, StatusCode::OK);
     assert_eq!(first_headers.get("x-cache-status").unwrap(), "MISS");
+    assert!(
+        first_headers
+            .get("server-timing")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("cache-write")
+    );
     assert_eq!(
         first_headers.get(header::CACHE_CONTROL).unwrap(),
         "public, max-age=3600"
@@ -151,6 +184,14 @@ async fn api_returns_metadata_then_hits_cache() {
     assert_eq!(second_status, StatusCode::OK);
     assert_eq!(second_headers.get("x-cache-status").unwrap(), "HIT");
     assert_eq!(second_headers.get("x-cache-source").unwrap(), "sqlite");
+    assert!(
+        second_headers
+            .get("server-timing")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("cache-read")
+    );
     assert_eq!(second_json["data"]["title"], "Example Title");
 }
 
@@ -206,7 +247,7 @@ async fn api_head_returns_empty_body() {
 }
 
 #[tokio::test]
-async fn image_proxy_forces_query_referer_and_transcodes() {
+async fn image_proxy_forces_query_referer_and_caches_processed_image() {
     let upstream = MockServer::start().await;
     let png_body = sample_png();
     let local_target_url = format!("{}/cover.png", upstream.uri());
@@ -224,6 +265,7 @@ async fn image_proxy_forces_query_referer_and_transcodes() {
                 .insert_header("content-type", "image/png")
                 .set_body_bytes(png_body),
         )
+        .expect(1)
         .mount(&upstream)
         .await;
 
@@ -236,13 +278,114 @@ async fn image_proxy_forces_query_referer_and_transcodes() {
     .await;
     let target = urlencoding::encode(&target_url).into_owned();
     let referer = urlencoding::encode("https://example.com/post?case=first").into_owned();
+    let request = || {
+        Request::builder()
+            .uri(format!("/proxy/image?url={target}&referer={referer}&w=64"))
+            .header(header::ACCEPT, "image/avif,image/webp,image/*")
+            .header(header::REFERER, "https://attacker.example/fake")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let response = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/avif"
+    );
+    assert_eq!(response.headers().get("x-image-optimized").unwrap(), "1");
+    assert_eq!(response.headers().get("x-cache-status").unwrap(), "MISS");
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=86400, immutable"
+    );
+    assert!(
+        response
+            .headers()
+            .get("server-timing")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("transform")
+    );
+
+    let cached = app.oneshot(request()).await.unwrap();
+    assert_eq!(cached.status(), StatusCode::OK);
+    assert_eq!(cached.headers().get("x-cache-status").unwrap(), "HIT");
+    assert_eq!(
+        cached.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/avif"
+    );
+}
+
+#[tokio::test]
+async fn image_proxy_redirects_when_s3_cache_backend_is_used() {
+    let state = AppState {
+        config: test_config(PathBuf::from("unused.db")),
+        client: reqwest::Client::new(),
+        cache: Arc::new(NoopMetadataCache),
+        image_cache: Arc::new(RedirectImageCache),
+        api_miss_limiter: Arc::new(Semaphore::new(8)),
+        image_miss_limiter: Arc::new(Semaphore::new(1)),
+    };
+    let app = router_with_state(state);
 
     let response = app
         .oneshot(
             Request::builder()
-                .uri(format!("/proxy/image?url={target}&referer={referer}&w=64"))
-                .header(header::ACCEPT, "image/avif,image/webp,image/*")
-                .header(header::REFERER, "https://attacker.example/fake")
+                .uri("/proxy/image?url=https%3A%2F%2Fcdn.example.com%2Fcover.png")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        "https://preview.example.com/image-cache/v1/f0/f0.jpg"
+    );
+}
+
+#[tokio::test]
+async fn image_proxy_uses_external_worker_in_low_memory_mode() {
+    let upstream = MockServer::start().await;
+    let png_body = sample_png();
+    let local_target_url = format!("{}/cover.png", upstream.uri());
+    let target_url = local_target_url
+        .replace("127.0.0.1", "image.example.test")
+        .replace("localhost", "image.example.test");
+    Mock::given(method("GET"))
+        .and(path("/cover.png"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(png_body),
+        )
+        .mount(&upstream)
+        .await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let mut config = test_config(temp_dir.path().join("cache.db"));
+    config.low_memory_mode = true;
+    config.image_worker_bin = Some(PathBuf::from(env!("CARGO_BIN_EXE_image_worker")));
+    let url = url::Url::parse(&local_target_url).unwrap();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .resolve(
+            "image.example.test",
+            SocketAddr::from(([127, 0, 0, 1], url.port_or_known_default().unwrap())),
+        )
+        .build()
+        .unwrap();
+    let app = build_app_with_client(config, client).await.unwrap();
+    let target = urlencoding::encode(&target_url).into_owned();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/proxy/image?url={target}&w=64"))
+                .header(header::ACCEPT, "image/webp,image/*")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -252,12 +395,7 @@ async fn image_proxy_forces_query_referer_and_transcodes() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers().get(header::CONTENT_TYPE).unwrap(),
-        "image/avif"
-    );
-    assert_eq!(response.headers().get("x-image-optimized").unwrap(), "1");
-    assert_eq!(
-        response.headers().get(header::CACHE_CONTROL).unwrap(),
-        "public, max-age=86400, immutable"
+        "image/webp"
     );
 }
 
@@ -268,4 +406,55 @@ fn sample_png() -> Vec<u8> {
         .write_to(&mut cursor, image::ImageFormat::Png)
         .unwrap();
     cursor.into_inner()
+}
+
+struct NoopMetadataCache;
+
+#[async_trait]
+impl CacheStore for NoopMetadataCache {
+    async fn get(
+        &self,
+        _key: &str,
+    ) -> Result<Option<CacheEnvelope>, unfurl_server::error::AppError> {
+        Ok(None)
+    }
+
+    async fn set(
+        &self,
+        _key: &str,
+        _data: &UnfurlData,
+        _ttl: u64,
+    ) -> Result<CacheEnvelope, unfurl_server::error::AppError> {
+        unreachable!("metadata cache should not be used in this test")
+    }
+
+    fn label(&self) -> &'static str {
+        "noop"
+    }
+}
+
+struct RedirectImageCache;
+
+#[async_trait]
+impl ImageCacheStore for RedirectImageCache {
+    async fn get(
+        &self,
+        _key: &str,
+        _object_key: &str,
+    ) -> Result<Option<ImageCacheHit>, unfurl_server::error::AppError> {
+        Ok(Some(ImageCacheHit::Redirect {
+            location: "https://preview.example.com/image-cache/v1/f0/f0.jpg".to_string(),
+        }))
+    }
+
+    async fn put(
+        &self,
+        _entry: ImageCacheWrite,
+    ) -> Result<ImageCacheHit, unfurl_server::error::AppError> {
+        unreachable!("image put should not be used when cache already hits")
+    }
+
+    fn label(&self) -> &'static str {
+        "s3"
+    }
 }

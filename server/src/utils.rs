@@ -5,13 +5,14 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, header},
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
     error::AppError,
     models::{
         ApiErrorResponse, ApiErrorShape, ApiSuccessResponse, CacheStatus, ImageFit, ImageFormat,
-        ResponseHeadersShape, UnfurlData,
+        ImageRequest, ResponseHeadersShape, UnfurlData,
     },
 };
 
@@ -414,6 +415,53 @@ pub fn build_image_proxy_url(origin: &str, asset_url: &str, referer_url: &str) -
     )
 }
 
+pub fn build_processed_image_cache_key(
+    target_url: &str,
+    referer: Option<&str>,
+    request: &ImageRequest,
+) -> String {
+    let raw = format!(
+        "image:v1|url={target_url}|referer={}|w={}|h={}|q={}|fit={}|format={}",
+        referer.unwrap_or_default(),
+        request
+            .width
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        request
+            .height
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        request.quality,
+        image_fit_slug(request.fit),
+        image_format_slug(&request.format),
+    );
+    let digest = Sha256::digest(raw.as_bytes());
+    format!("image:v1:{digest:x}")
+}
+
+pub fn build_processed_image_object_key(
+    prefix: &str,
+    cache_key: &str,
+    format: &ImageFormat,
+) -> String {
+    let digest = cache_key.rsplit(':').next().unwrap_or(cache_key);
+    let folder = &digest[..2.min(digest.len())];
+    let prefix = prefix.trim_matches('/');
+    format!(
+        "{prefix}/v1/{folder}/{digest}.{}",
+        image_extension_for_format(format)
+    )
+}
+
+pub fn image_extension_for_format(format: &ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Avif => "avif",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Jpeg | ImageFormat::Auto => "jpg",
+        ImageFormat::Png => "png",
+    }
+}
+
 pub fn request_origin(headers: &HeaderMap) -> String {
     let host = headers
         .get("x-forwarded-host")
@@ -433,4 +481,24 @@ pub fn clamp_quality(quality: u64) -> u8 {
 
 fn header_value(value: &str) -> HeaderValue {
     HeaderValue::from_str(value).unwrap_or_else(|_| HeaderValue::from_static(""))
+}
+
+fn image_fit_slug(fit: ImageFit) -> &'static str {
+    match fit {
+        ImageFit::ScaleDown => "scale-down",
+        ImageFit::Contain => "contain",
+        ImageFit::Cover => "cover",
+        ImageFit::Crop => "crop",
+        ImageFit::Pad => "pad",
+    }
+}
+
+fn image_format_slug(format: &ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Avif => "avif",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Jpeg => "jpeg",
+        ImageFormat::Png => "png",
+        ImageFormat::Auto => "auto",
+    }
 }

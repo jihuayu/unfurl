@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -108,7 +109,7 @@ pub struct CacheEnvelope {
     pub ttl: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageRequest {
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -120,6 +121,29 @@ pub struct ImageRequest {
 #[derive(Debug, Clone)]
 pub struct ProcessedImage {
     pub bytes: Vec<u8>,
-    pub content_type: &'static str,
+    pub content_type: String,
     pub optimized: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedImage {
+    pub bytes: Bytes,
+    pub content_type: String,
+    pub optimized: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum ImageCacheHit {
+    Inline(CachedImage),
+    Redirect { location: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageCacheWrite {
+    pub cache_key: String,
+    pub object_key: String,
+    pub bytes: Bytes,
+    pub content_type: String,
+    pub optimized: bool,
+    pub ttl: u64,
 }
