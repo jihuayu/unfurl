@@ -10,7 +10,7 @@ on:
       bench_concurrencies:
         description: Comma-separated concurrency levels for the benchmark filter
         required: false
-        default: "10,50,200"
+        default: "10,50"
       bench_hit_modes:
         description: Comma-separated hit modes for the benchmark filter
         required: false
@@ -23,6 +23,10 @@ on:
         description: Comma-separated image cache backends for the benchmark filter
         required: false
         default: "sqlite,s3"
+      bench_low_memory_modes:
+        description: Comma-separated low memory mode states for benchmark shards
+        required: false
+        default: "false,true"
       run_lifecycle_bench:
         description: Run the long lifecycle benchmark job
         required: false
@@ -40,6 +44,35 @@ permissions:
   contents: read
 
 jobs:
+  build-binaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            server -> target
+
+      - name: Build benchmark binaries
+        working-directory: server
+        run: cargo build --release --bin benchmark --bin lifecycle_bench --bin image_worker
+
+      - name: Upload benchmark binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-benchmark-binaries
+          path: |
+            server/target/release/benchmark
+            server/target/release/lifecycle_bench
+            server/target/release/image_worker
+
   plan:
     runs-on: ubuntu-latest
     outputs:
@@ -53,7 +86,8 @@ jobs:
         shell: bash
         env:
           BENCH_CACHE_SIZES_INPUT: ${{ github.event.inputs.bench_cache_sizes || '50,200,1000' }}
-          BENCH_CONCURRENCIES_INPUT: ${{ github.event.inputs.bench_concurrencies || '10,50,200' }}
+          BENCH_CONCURRENCIES_INPUT: ${{ github.event.inputs.bench_concurrencies || '10,50' }}
+          BENCH_LOW_MEMORY_MODES_INPUT: ${{ github.event.inputs.bench_low_memory_modes || 'false,true' }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
@@ -61,15 +95,19 @@ jobs:
 
           cache_sizes = [item.strip() for item in os.environ["BENCH_CACHE_SIZES_INPUT"].split(",") if item.strip()]
           concurrencies = [item.strip() for item in os.environ["BENCH_CONCURRENCIES_INPUT"].split(",") if item.strip()]
+          low_memory_modes = [item.strip().lower() for item in os.environ["BENCH_LOW_MEMORY_MODES_INPUT"].split(",") if item.strip()]
 
           include = []
           for cache_size in cache_sizes:
               for concurrency in concurrencies:
-                  include.append({
-                      "cache_size": cache_size,
-                      "concurrency": concurrency,
-                      "artifact_suffix": f"cache{cache_size}-conc{concurrency}",
-                  })
+                  for low_memory_mode in low_memory_modes:
+                      mode_label = "lowmem" if low_memory_mode == "true" else "standard"
+                      include.append({
+                          "cache_size": cache_size,
+                          "concurrency": concurrency,
+                          "low_memory_mode": low_memory_mode,
+                          "artifact_suffix": f"cache{cache_size}-conc{concurrency}-{mode_label}",
+                      })
 
           print(f"matrix={json.dumps({'include': include})}")
           PY
@@ -89,13 +127,16 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   benchmark:
-    needs: plan
+    needs:
+      - build-binaries
+      - plan
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     env:
+      LOW_MEMORY_MODE: ${{ matrix.low_memory_mode }}
       BENCH_CACHE_SIZES: ${{ matrix.cache_size }}
       BENCH_CONCURRENCIES: ${{ matrix.concurrency }}
       BENCH_HIT_MODES: ${{ needs.plan.outputs.bench_hit_modes }}
@@ -113,14 +154,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
+      - name: Download benchmark binaries
+        uses: actions/download-artifact@v4
         with:
-          workspaces: |
-            server -> target
+          name: server-benchmark-binaries
+          path: server/target/release
+
+      - name: Make binaries executable
+        shell: bash
+        run: chmod +x server/target/release/benchmark server/target/release/lifecycle_bench server/target/release/image_worker
 
       - name: Start MinIO container
         shell: bash
@@ -147,7 +189,7 @@ jobs:
 
       - name: Run server benchmark shard
         working-directory: server
-        run: cargo run --release --bin benchmark
+        run: ./target/release/benchmark
 
       - name: Upload shard artifacts
         uses: actions/upload-artifact@v4
@@ -200,36 +242,56 @@ jobs:
 
   lifecycle-benchmark:
     if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.run_lifecycle_bench || 'false') == 'true' }}
+    needs: build-binaries
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - memory_mode: standard
+            low_memory_mode: "false"
+            artifact_suffix: standard
+          - memory_mode: low_memory
+            low_memory_mode: "true"
+            artifact_suffix: low_memory
+    env:
+      LOW_MEMORY_MODE: ${{ matrix.low_memory_mode }}
+      LIFECYCLE_MEMORY_MODES: ${{ matrix.memory_mode }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
+      - name: Download benchmark binaries
+        uses: actions/download-artifact@v4
         with:
-          workspaces: |
-            server -> target
+          name: server-benchmark-binaries
+          path: server/target/release
+
+      - name: Make binaries executable
+        shell: bash
+        run: chmod +x server/target/release/benchmark server/target/release/lifecycle_bench server/target/release/image_worker
 
       - name: Run lifecycle benchmark
         working-directory: server
-        run: cargo run --release --bin lifecycle_bench
+        run: ./target/release/lifecycle_bench
+
+      - name: Rename lifecycle benchmark outputs
+        working-directory: server
+        run: |
+          mv lifecycle-bench-results.json lifecycle-bench-results-${{ matrix.artifact_suffix }}.json
 
       - name: Render lifecycle benchmark report
-        run: python3 server/scripts/render_lifecycle_benchmark_report.py --input server/lifecycle-bench-results.json --output server/lifecycle-benchmark-report.md
+        run: python3 server/scripts/render_lifecycle_benchmark_report.py --input server/lifecycle-bench-results-${{ matrix.artifact_suffix }}.json --output server/lifecycle-benchmark-report-${{ matrix.artifact_suffix }}.md
 
       - name: Publish lifecycle benchmark summary
         shell: bash
-        run: cat server/lifecycle-benchmark-report.md >> "$GITHUB_STEP_SUMMARY"
+        run: cat server/lifecycle-benchmark-report-${{ matrix.artifact_suffix }}.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload lifecycle benchmark artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: lifecycle-benchmark-report
+          name: lifecycle-benchmark-report-${{ matrix.artifact_suffix }}
           path: |
-            server/lifecycle-bench-results.json
-            server/lifecycle-benchmark-report.md
+            server/lifecycle-bench-results-${{ matrix.artifact_suffix }}.json
+            server/lifecycle-benchmark-report-${{ matrix.artifact_suffix }}.md

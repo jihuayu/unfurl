@@ -11,6 +11,7 @@ def format_float(value: float) -> str:
 
 def scenario_key(item: dict) -> tuple:
     return (
+        item.get("low_memory_mode", False),
         item.get("image_cache_backend", ""),
         item.get("endpoint", ""),
         item.get("hit_mode", ""),
@@ -39,8 +40,8 @@ def build_markdown(report: dict) -> str:
             "",
             "## Scenario Summary",
             "",
-            "| Backend | Endpoint | Hit Mode | Cache Size | Concurrency | Avg (ms) | P95 (ms) | Hit Avg (ms) | Miss Avg (ms) | Peak Mem (MB) | Peak CPU (%) |",
-            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Low Memory | Backend | Endpoint | Hit Mode | Cache Size | Concurrency | Avg (ms) | P95 (ms) | Hit Avg (ms) | Miss Avg (ms) | Peak Mem (MB) | Peak CPU (%) |",
+            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
 
@@ -50,7 +51,8 @@ def build_markdown(report: dict) -> str:
         miss_latency = scenario.get("miss_latency", {})
         resources = scenario.get("resources", {})
         lines.append(
-            "| {backend} | {endpoint} | {hit_mode} | {cache_size} | {concurrency} | {avg_ms} | {p95_ms} | {hit_avg_ms} | {miss_avg_ms} | {peak_memory_mb} | {peak_cpu_percent} |".format(
+            "| {low_memory_mode} | {backend} | {endpoint} | {hit_mode} | {cache_size} | {concurrency} | {avg_ms} | {p95_ms} | {hit_avg_ms} | {miss_avg_ms} | {peak_memory_mb} | {peak_cpu_percent} |".format(
+                low_memory_mode="true" if scenario.get("low_memory_mode", False) else "false",
                 backend=scenario.get("image_cache_backend", ""),
                 endpoint=scenario.get("endpoint", ""),
                 hit_mode=scenario.get("hit_mode", ""),
@@ -75,7 +77,8 @@ def build_markdown(report: dict) -> str:
                 "",
                 "## Highlights",
                 "",
-                "- Slowest average latency: `{backend}/{endpoint}/{hit_mode}` at cache size `{cache_size}` and concurrency `{concurrency}` with `{avg_ms} ms`.".format(
+                "- Slowest average latency: `low_memory={low_memory_mode} {backend}/{endpoint}/{hit_mode}` at cache size `{cache_size}` and concurrency `{concurrency}` with `{avg_ms} ms`.".format(
+                    low_memory_mode="true" if slowest.get("low_memory_mode", False) else "false",
                     backend=slowest.get("image_cache_backend", ""),
                     endpoint=slowest.get("endpoint", ""),
                     hit_mode=slowest.get("hit_mode", ""),
@@ -83,7 +86,8 @@ def build_markdown(report: dict) -> str:
                     concurrency=slowest.get("concurrency", 0),
                     avg_ms=format_float(slowest.get("total_latency", {}).get("avg_ms", 0.0)),
                 ),
-                "- Highest peak memory: `{backend}/{endpoint}/{hit_mode}` at cache size `{cache_size}` and concurrency `{concurrency}` with `{peak_memory_mb} MB`.".format(
+                "- Highest peak memory: `low_memory={low_memory_mode} {backend}/{endpoint}/{hit_mode}` at cache size `{cache_size}` and concurrency `{concurrency}` with `{peak_memory_mb} MB`.".format(
+                    low_memory_mode="true" if highest_memory.get("low_memory_mode", False) else "false",
                     backend=highest_memory.get("image_cache_backend", ""),
                     endpoint=highest_memory.get("endpoint", ""),
                     hit_mode=highest_memory.get("hit_mode", ""),
@@ -91,7 +95,8 @@ def build_markdown(report: dict) -> str:
                     concurrency=highest_memory.get("concurrency", 0),
                     peak_memory_mb=format_float(highest_memory.get("resources", {}).get("peak_memory_mb", 0.0)),
                 ),
-                "- Highest peak CPU: `{backend}/{endpoint}/{hit_mode}` at cache size `{cache_size}` and concurrency `{concurrency}` with `{peak_cpu_percent}%`.".format(
+                "- Highest peak CPU: `low_memory={low_memory_mode} {backend}/{endpoint}/{hit_mode}` at cache size `{cache_size}` and concurrency `{concurrency}` with `{peak_cpu_percent}%`.".format(
+                    low_memory_mode="true" if highest_cpu.get("low_memory_mode", False) else "false",
                     backend=highest_cpu.get("image_cache_backend", ""),
                     endpoint=highest_cpu.get("endpoint", ""),
                     hit_mode=highest_cpu.get("hit_mode", ""),

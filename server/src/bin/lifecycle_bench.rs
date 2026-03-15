@@ -142,6 +142,14 @@ impl MemoryMode {
             Self::LowMemory => "true",
         }
     }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "standard" => Some(Self::Standard),
+            "low_memory" | "low-memory" => Some(Self::LowMemory),
+            _ => None,
+        }
+    }
 }
 
 // ── 资源统计 ──────────────────────────────────────────────────────────────
@@ -336,6 +344,7 @@ async fn main() -> Result<(), BenchError> {
 
 async fn run_orchestrator() -> Result<(), BenchError> {
     let executable = std::env::current_exe()?;
+    let selected_modes = selected_memory_modes_from_env()?;
     println!("=== Lifecycle Benchmark 开始 ===");
     println!(
         "每阶段持续时间: {}分钟，缓存大小: {}",
@@ -348,7 +357,7 @@ async fn run_orchestrator() -> Result<(), BenchError> {
 
     let mut results = Vec::new();
 
-    for &mode in &[MemoryMode::Standard, MemoryMode::LowMemory] {
+    for &mode in &selected_modes {
         println!("\n>>> 运行内存模式: {} <<<", mode.label());
         let report = run_lifecycle_for_mode(&executable, mock.address.port(), mode).await?;
         results.push(report);
@@ -375,6 +384,27 @@ async fn run_orchestrator() -> Result<(), BenchError> {
     println!("\n=== 结果已写入 {output_path} ===");
     println!("{output}");
     Ok(())
+}
+
+fn selected_memory_modes_from_env() -> Result<Vec<MemoryMode>, BenchError> {
+    let Some(raw) = std::env::var("LIFECYCLE_MEMORY_MODES").ok() else {
+        return Ok(vec![MemoryMode::Standard, MemoryMode::LowMemory]);
+    };
+
+    let mut modes = Vec::new();
+    for item in raw.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+        let mode = MemoryMode::parse(item)
+            .ok_or_else(|| format!("invalid LIFECYCLE_MEMORY_MODES item `{item}`"))?;
+        if !modes.contains(&mode) {
+            modes.push(mode);
+        }
+    }
+
+    if modes.is_empty() {
+        Ok(vec![MemoryMode::Standard, MemoryMode::LowMemory])
+    } else {
+        Ok(modes)
+    }
 }
 
 async fn run_lifecycle_for_mode(

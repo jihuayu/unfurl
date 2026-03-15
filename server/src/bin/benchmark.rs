@@ -159,6 +159,7 @@ struct StageLatencyStats {
 
 #[derive(Debug, Clone, Serialize)]
 struct ScenarioReport {
+    low_memory_mode: bool,
     endpoint: EndpointKind,
     hit_mode: HitMode,
     image_cache_backend: ImageBackendKind,
@@ -273,6 +274,7 @@ async fn run_orchestrator() -> Result<(), BenchError> {
     let mock = spawn_mock_process(&executable).await?;
     let s3_config = BenchmarkS3Config::from_env();
     let filter = BenchmarkFilter::from_env()?;
+    let low_memory_mode = parse_env_bool("LOW_MEMORY_MODE", false);
 
     if let Some(config) = &s3_config {
         ensure_bucket_public(config).await?;
@@ -288,6 +290,7 @@ async fn run_orchestrator() -> Result<(), BenchError> {
                 ImageBackendKind::Sqlite,
                 None,
                 &filter,
+                low_memory_mode,
             )
             .await?,
         );
@@ -301,6 +304,7 @@ async fn run_orchestrator() -> Result<(), BenchError> {
                     ImageBackendKind::S3,
                     Some(config.clone()),
                     &filter,
+                    low_memory_mode,
                 )
                 .await?,
             );
@@ -329,9 +333,11 @@ async fn run_profile(
     image_backend: ImageBackendKind,
     s3_config: Option<BenchmarkS3Config>,
     filter: &BenchmarkFilter,
+    low_memory_mode: bool,
 ) -> Result<Vec<ScenarioReport>, BenchError> {
     println!(
-        "starting profile: image_backend={} cache_size={}",
+        "starting profile: low_memory_mode={} image_backend={} cache_size={}",
+        low_memory_mode,
         image_backend.label(),
         cache_size
     );
@@ -405,10 +411,12 @@ async fn run_profile(
                     image_backend,
                     cache_size,
                     concurrency,
+                    low_memory_mode,
                 )
                 .await?;
                 println!(
-                    "done: backend={} endpoint={} hit_mode={} cache_size={} concurrency={} total_avg={:.2}ms hit_avg={:.2}ms miss_avg={:.2}ms peak_mem={:.2}MB peak_cpu={:.2}%",
+                    "done: low_memory_mode={} backend={} endpoint={} hit_mode={} cache_size={} concurrency={} total_avg={:.2}ms hit_avg={:.2}ms miss_avg={:.2}ms peak_mem={:.2}MB peak_cpu={:.2}%",
+                    low_memory_mode,
                     image_backend.label(),
                     endpoint.label(),
                     hit_mode.label(),
@@ -527,6 +535,13 @@ fn parse_image_backend_item(value: &str) -> Result<ImageBackendKind, BenchError>
     }
 }
 
+fn parse_env_bool(name: &str, default_value: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(default_value)
+}
+
 async fn execute_scenario(
     server_pid: u32,
     client: reqwest::Client,
@@ -536,6 +551,7 @@ async fn execute_scenario(
     image_cache_backend: ImageBackendKind,
     cache_size: usize,
     concurrency: usize,
+    low_memory_mode: bool,
 ) -> Result<ScenarioReport, BenchError> {
     let resource_stats = Arc::new(Mutex::new(ResourceAccumulator::default()));
     let running = Arc::new(AtomicBool::new(true));
@@ -567,6 +583,7 @@ async fn execute_scenario(
         .collect::<Vec<_>>();
 
     Ok(ScenarioReport {
+        low_memory_mode,
         endpoint,
         hit_mode,
         image_cache_backend,

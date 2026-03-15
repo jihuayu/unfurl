@@ -7,6 +7,7 @@ from pathlib import Path
 
 def scenario_key(item: dict) -> tuple:
     return (
+        item.get("low_memory_mode", False),
         item.get("image_cache_backend", ""),
         item.get("endpoint", ""),
         item.get("hit_mode", ""),
