@@ -20,7 +20,7 @@ export function normalizeTargetUrl(rawUrl: string): string {
 
   url.search = "";
   for (const [key, value] of entries) {
-    url.searchParams.append(key.toLowerCase(), value);
+    url.searchParams.append(key, value);
   }
 
   return url.toString();
@@ -30,7 +30,7 @@ function normalizePathname(pathname: string): string {
   const normalized = pathname.length > 1 && pathname.endsWith("/")
     ? pathname.slice(0, -1)
     : pathname;
-  return normalized.toLowerCase() || "/";
+  return normalized || "/";
 }
 
 export function buildUnfurlCacheKey(rawUrl: string): string {

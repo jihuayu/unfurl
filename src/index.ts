@@ -3,6 +3,14 @@ import { handleUnfurl } from "./handlers/unfurl";
 import type { Env } from "./types";
 import { AppError, createCorsHeaders, createErrorResponse, jsonResponse, withCors } from "./utils";
 
+function withoutBody(response: Response): Response {
+  return new Response(null, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers
+  });
+}
+
 async function routeRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
 
@@ -63,7 +71,7 @@ export default {
 
     try {
       const response = await routeRequest(request, env, ctx);
-      return withCors(response);
+      return withCors(request.method === "HEAD" ? withoutBody(response) : response);
     } catch (error) {
       return withCors(createErrorResponse(error, startedAt));
     }

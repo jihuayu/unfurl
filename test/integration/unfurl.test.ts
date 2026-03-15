@@ -115,6 +115,32 @@ describe("GET /api", () => {
     expect(cachedEnvelope?.ttl).toBe(86400);
   });
 
+  it("returns an empty body for HEAD requests", async () => {
+    const env = createEnv();
+    const ctx = createExecutionContext();
+    const originFetch = vi.fn<typeof fetch>().mockImplementation(async () =>
+      new Response(fullOgHtml, {
+        headers: {
+          "content-type": "text/html; charset=utf-8"
+        }
+      })
+    );
+    vi.stubGlobal("fetch", originFetch as unknown as typeof fetch);
+
+    const response = await worker.fetch(
+      new Request("https://service.example/api?url=https://example.com/post?case=head", {
+        method: "HEAD"
+      }),
+      env,
+      ctx
+    );
+    await ctx.drain();
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("application/json");
+    expect(await response.text()).toBe("");
+  });
+
   it("rejects private targets", async () => {
     const env = createEnv();
     const response = await worker.fetch(
@@ -128,4 +154,3 @@ describe("GET /api", () => {
     expect(json.error.code).toBe("PRIVATE_IP");
   });
 });
-

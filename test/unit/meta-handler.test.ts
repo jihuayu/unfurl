@@ -65,4 +65,19 @@ describe("meta extraction", () => {
     expect(result.description).toBeNull();
     expect(result.image?.url).toBe("https://example.com/broken.png");
   });
+
+  it("ignores metadata that appears inside the body", async () => {
+    const metadata = await extractHeadMetadata(
+      new Response(`<!doctype html><html lang="en"><head><title>Head Title</title></head><body><meta property="og:title" content="Body Title"><meta name="description" content="Body Description"></body></html>`, {
+        headers: {
+          "content-type": "text/html"
+        }
+      })
+    );
+
+    const result = mergeMetaTags(metadata, "https://example.com/article");
+
+    expect(result.title).toBe("Head Title");
+    expect(result.description).toBeNull();
+  });
 });

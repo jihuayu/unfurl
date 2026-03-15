@@ -35,7 +35,7 @@ describe("GET /proxy/image", () => {
     expect(response.headers.get("x-image-optimized")).toBe("1");
     expect(response.headers.get("cache-control")).toBe("public, max-age=86400, immutable");
     const requestInit = fetchSpy.mock.calls[0]?.[1] as RequestInit & {
-      cf?: { image?: { format?: string; width?: number } };
+      cf?: { image?: { format?: string; width?: number }; cacheTtl?: number };
     };
     expect(requestInit.cf?.image?.format).toBe("avif");
     expect(requestInit.cf?.image?.width).toBe(200);
@@ -116,5 +116,28 @@ describe("GET /proxy/image", () => {
     };
     expect(requestInit.cf?.cacheTtl).toBe(172800);
   });
-});
 
+  it("returns an empty body for HEAD requests", async () => {
+    const env = createEnv();
+    const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response("image-bytes", {
+        headers: {
+          "content-type": "image/png"
+        }
+      })
+    );
+    vi.stubGlobal("fetch", fetchSpy as unknown as typeof fetch);
+
+    const response = await worker.fetch(
+      new Request("https://service.example/proxy/image?url=https://cdn.example.com/raw.png", {
+        method: "HEAD"
+      }),
+      env,
+      createExecutionContext()
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("image/png");
+    expect(await response.text()).toBe("");
+  });
+});

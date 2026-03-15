@@ -84,9 +84,9 @@ export async function extractHeadMetadata(response: Response): Promise<RawHeadMe
   const metadata = createEmptyMetadata();
   const transformed = new HTMLRewriter()
     .on("html", new HtmlHandler(metadata))
-    .on("meta", new MetaHandler(metadata))
-    .on("link", new LinkHandler(metadata))
-    .on("title", new TitleHandler(metadata))
+    .on("head meta", new MetaHandler(metadata))
+    .on("head link", new LinkHandler(metadata))
+    .on("head title", new TitleHandler(metadata))
     .transform(response);
 
   await transformed.arrayBuffer();
