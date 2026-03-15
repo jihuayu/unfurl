@@ -219,37 +219,12 @@ jobs:
         working-directory: server
         run: cargo run --release --bin lifecycle_bench
 
+      - name: Render lifecycle benchmark report
+        run: python3 server/scripts/render_lifecycle_benchmark_report.py --input server/lifecycle-bench-results.json --output server/lifecycle-benchmark-report.md
+
       - name: Publish lifecycle benchmark summary
         shell: bash
-        run: |
-          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
-          import json
-          from pathlib import Path
-
-          report = json.loads(Path("server/lifecycle-bench-results.json").read_text(encoding="utf-8"))
-          print("# Lifecycle Benchmark Report")
-          print()
-          print(f"- Generated at: `{report.get('generated_at', 'unknown')}`")
-          print(f"- Phase duration: `{report.get('phase_duration_secs', 0)}` seconds")
-          print(f"- Cache size: `{report.get('cache_size', 0)}`")
-          print()
-          print("| Memory Mode | Phase | Avg RPS | Avg Lat (ms) | P99 Lat (ms) | Peak Mem (MB) | Peak CPU (%) | Success Ratio |")
-          print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
-          for mode in report.get("results", []):
-              mode_name = mode.get("memory_mode", "")
-              for phase in mode.get("phases", []):
-                  resources = phase.get("resources", {})
-                  latency = phase.get("latency", {})
-                  print(
-                      f"| {mode_name} | {phase.get('phase', '')} | "
-                      f"{phase.get('avg_rps', 0.0):.2f} | "
-                      f"{latency.get('avg_ms', 0.0):.2f} | "
-                      f"{latency.get('p99_ms', 0.0):.2f} | "
-                      f"{resources.get('peak_memory_mb', 0.0):.2f} | "
-                      f"{resources.get('peak_cpu_percent', 0.0):.2f} | "
-                      f"{phase.get('success_ratio', 0.0):.4f} |"
-                  )
-          PY
+        run: cat server/lifecycle-benchmark-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload lifecycle benchmark artifacts
         uses: actions/upload-artifact@v4
@@ -257,3 +232,4 @@ jobs:
           name: lifecycle-benchmark-report
           path: |
             server/lifecycle-bench-results.json
+            server/lifecycle-benchmark-report.md
