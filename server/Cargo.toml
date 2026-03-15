@@ -8,6 +8,9 @@ async-trait = "0.1.88"
 axum = { version = "0.8.1", features = ["macros"] }
 bytes = "1.10.1"
 image = { version = "0.25.6", default-features = false, features = ["avif", "bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
+opentelemetry = { version = "0.28.0", features = ["trace"] }
+opentelemetry-otlp = { version = "0.28.0", features = ["grpc-tonic", "trace"] }
+opentelemetry_sdk = { version = "0.28.0", features = ["rt-tokio", "trace"] }
 redis = { version = "0.32.7", features = ["tokio-comp"] }
 reqwest = { version = "0.12.15", default-features = false, features = ["brotli", "deflate", "gzip", "http2", "rustls-tls"] }
 scraper = "0.23.1"
@@ -19,6 +22,7 @@ time = { version = "0.3.37", features = ["formatting"] }
 tokio = { version = "1.44.1", features = ["full"] }
 tower-http = { version = "0.6.2", features = ["cors", "trace"] }
 tracing = "0.1.41"
+tracing-opentelemetry = "0.29.0"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 url = "2.5.4"
 urlencoding = "2.1.3"

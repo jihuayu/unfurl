@@ -22,6 +22,7 @@ Image proxying and basic transform/format negotiation are handled inside the ser
   - `fit` modes
   - `auto` format negotiation
   - forced `referer` from query param
+- OTLP trace export support
 - Docker deployment support
 
 ## Project Layout
@@ -31,6 +32,7 @@ Image proxying and basic transform/format negotiation are handled inside the ser
 - `src/cache.rs`: cache abstraction + SQLite/Redis backends
 - `src/extract.rs`: HTML head metadata extraction and merge logic
 - `src/image_proxy.rs`: image transform pipeline
+- `src/telemetry.rs`: tracing and OTLP initialization
 - `compose.yaml`: local container deployment example
 - `Dockerfile`: production image build
 
@@ -58,8 +60,31 @@ Environment variables:
 | `IMAGE_CACHE_TTL` | `86400` | Browser image cache TTL |
 | `OG_CACHE_TTL` | `43200` | Metadata cache TTL |
 | `FETCH_TIMEOUT_MS` | `8000` | Upstream fetch timeout |
+| `OTEL_SERVICE_NAME` | `unfurl-server` | OTLP service name |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | empty | Enable OTLP export when set |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | exporter default | Usually `grpc` when sending to `4317` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | empty | Optional OTLP auth headers |
 
 A sample env file is provided at `.env.example`.
+
+## OTLP Support
+
+By default the server only writes local logs.
+
+OTLP export is enabled automatically when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
+
+Example collector settings:
+
+```env
+OTEL_SERVICE_NAME=unfurl-server
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+```
+
+Current behavior:
+- local structured logging stays enabled
+- traces are also exported through OTLP
+- if OTLP is not configured, the service still runs normally
 
 ## Run Locally
 
@@ -130,6 +155,20 @@ cd server
 CACHE_BACKEND=redis REDIS_URL=redis://redis:6379/0 docker compose --profile redis up --build
 ```
 
+### Option 4: Docker with OTLP collector
+
+If your collector is reachable as `otel-collector:4317` from the container network:
+
+```bash
+cd server
+docker run --rm -p 8080:8080 \
+  -v "$(pwd)/data:/data" \
+  -e OTEL_SERVICE_NAME=unfurl-server \
+  -e OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317 \
+  -e OTEL_EXPORTER_OTLP_PROTOCOL=grpc \
+  unfurl-server
+```
+
 ## Deployment Notes
 
 ### Reverse Proxy
@@ -150,6 +189,12 @@ The server uses these headers to build image proxy URLs returned by `/api`.
 
 - SQLite mode is best for single-instance deployment
 - Redis mode is better when you run multiple app instances
+
+### Observability
+
+- OTLP export is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set
+- Send traces to an OpenTelemetry Collector, Tempo, Jaeger, or another OTLP-compatible backend
+- Keep local logs enabled even when OTLP is on, so startup and failure diagnostics remain visible
 
 ## API Usage
 
@@ -241,6 +286,7 @@ This server intentionally mirrors the current Worker behavior in the following a
 - No auth or rate limiting
 - SQLite mode is not designed for high-write clustered deployments
 - Image transforms use the Rust `image` crate; behavior is practical and compatible, but not byte-identical to Cloudflare Image Resizing
+- Current OTLP support exports traces only, not metrics or logs
 
 ## Suggested Production Setup
 
@@ -248,4 +294,5 @@ This server intentionally mirrors the current Worker behavior in the following a
 2. Mount `/data` if using SQLite.
 3. Use Redis if you deploy multiple instances.
 4. Add external rate limiting if the service is public.
-5. Monitor upstream fetch failures and image transform errors.
+5. Export traces to an OTLP collector.
+6. Monitor upstream fetch failures and image transform errors.

@@ -7,6 +7,7 @@ pub mod image_proxy;
 pub mod models;
 pub mod routes;
 pub mod state;
+pub mod telemetry;
 pub mod utils;
 
 use axum::Router;
