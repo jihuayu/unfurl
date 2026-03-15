@@ -1,0 +1,22 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env.example
+    environment:
+      CACHE_BACKEND: ${CACHE_BACKEND:-sqlite}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    volumes:
+      - ./data:/data
+    depends_on:
+      redis:
+        condition: service_started
+        required: false
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["redis"]
+    ports:
+      - "6379:6379"
