@@ -25,5 +25,4 @@ ENV HOST=0.0.0.0 \
     SQLITE_PATH=/data/unfurl.db
 
 EXPOSE 8080
-VOLUME ["/data"]
 CMD ["unfurl-server"]
