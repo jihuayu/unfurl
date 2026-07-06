@@ -244,6 +244,60 @@ async fn api_fetches_normalized_target_url() {
 }
 
 #[tokio::test]
+async fn api_none_cache_backend_always_misses() {
+    let upstream = MockServer::start().await;
+    let local_page_url = format!("{}/page", upstream.uri());
+    let page_url = local_page_url
+        .replace("127.0.0.1", "mock.example.test")
+        .replace("localhost", "mock.example.test");
+    Mock::given(method("GET"))
+        .and(path("/page"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<!doctype html><html><head><title>No cache</title></head></html>",
+            "text/html; charset=utf-8",
+        ))
+        .expect(2)
+        .mount(&upstream)
+        .await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let mut config = test_config(temp_dir.path().join("cache.db"));
+    config.cache_backend = CacheBackend::None;
+    let url = url::Url::parse(&local_page_url).unwrap();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .resolve(
+            "mock.example.test",
+            SocketAddr::from(([127, 0, 0, 1], url.port_or_known_default().unwrap())),
+        )
+        .build()
+        .unwrap();
+    let app = build_app_with_client(config, client).await.unwrap();
+    let encoded = urlencoding::encode(&page_url).into_owned();
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api?url={encoded}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("x-cache-status").unwrap(), "MISS");
+        assert_eq!(json["data"]["title"], "No cache");
+    }
+}
+
+#[tokio::test]
 async fn api_head_returns_empty_body() {
     let upstream = MockServer::start().await;
     let local_page_url = format!("{}/page", upstream.uri());
@@ -433,6 +487,58 @@ async fn image_proxy_forces_query_referer_and_caches_processed_image() {
         cached.headers().get(header::CONTENT_TYPE).unwrap(),
         "image/avif"
     );
+}
+
+#[tokio::test]
+async fn image_proxy_none_cache_backend_always_misses() {
+    let upstream = MockServer::start().await;
+    let png_body = sample_png();
+    let local_target_url = format!("{}/cover.png", upstream.uri());
+    let target_url = local_target_url
+        .replace("127.0.0.1", "image.example.test")
+        .replace("localhost", "image.example.test");
+    Mock::given(method("GET"))
+        .and(path("/cover.png"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(png_body),
+        )
+        .expect(2)
+        .mount(&upstream)
+        .await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let mut config = test_config(temp_dir.path().join("cache.db"));
+    config.image_cache_backend = ImageCacheBackend::None;
+    let url = url::Url::parse(&local_target_url).unwrap();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .resolve(
+            "image.example.test",
+            SocketAddr::from(([127, 0, 0, 1], url.port_or_known_default().unwrap())),
+        )
+        .build()
+        .unwrap();
+    let app = build_app_with_client(config, client).await.unwrap();
+    let target = urlencoding::encode(&target_url).into_owned();
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/proxy/image?url={target}&f=png"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("x-cache-status").unwrap(), "MISS");
+        assert_eq!(response.headers().get("x-image-optimized").unwrap(), "0");
+    }
 }
 
 #[tokio::test]

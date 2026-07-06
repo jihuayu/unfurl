@@ -19,7 +19,9 @@ RUN mkdir -p /data
 
 ENV HOST=0.0.0.0 \
     PORT=8080 \
-    CACHE_BACKEND=sqlite \
+    CACHE_BACKEND=none \
+    IMAGE_CACHE_BACKEND=none \
+    IMAGE_CACHE_TTL=604800 \
     SQLITE_PATH=/data/unfurl.db
 
 EXPOSE 8080

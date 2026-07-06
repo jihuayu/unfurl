@@ -23,6 +23,7 @@ pub trait CacheStore: Send + Sync {
 
 pub async fn build_cache(config: &Config) -> Result<Arc<dyn CacheStore>, AppError> {
     match config.cache_backend {
+        CacheBackend::None => Ok(Arc::new(NoopCache)),
         CacheBackend::Sqlite => Ok(Arc::new(
             SqliteCache::new(
                 &config.sqlite_path,
@@ -36,6 +37,28 @@ pub async fn build_cache(config: &Config) -> Result<Arc<dyn CacheStore>, AppErro
                 redis::Client::open(config.redis_url.clone().expect("redis url validated"))?;
             Ok(Arc::new(RedisCache { client }))
         }
+    }
+}
+
+pub struct NoopCache;
+
+#[async_trait]
+impl CacheStore for NoopCache {
+    async fn get(&self, _key: &str) -> Result<Option<CacheEnvelope>, AppError> {
+        Ok(None)
+    }
+
+    async fn set(
+        &self,
+        _key: &str,
+        data: &UnfurlData,
+        ttl: u64,
+    ) -> Result<CacheEnvelope, AppError> {
+        build_envelope(data.clone(), ttl)
+    }
+
+    fn label(&self) -> &'static str {
+        "none"
     }
 }
 

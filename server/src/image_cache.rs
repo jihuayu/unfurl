@@ -26,6 +26,7 @@ pub trait ImageCacheStore: Send + Sync {
 
 pub async fn build_image_cache(config: &Config) -> Result<Arc<dyn ImageCacheStore>, AppError> {
     match config.image_cache_backend {
+        ImageCacheBackend::None => Ok(Arc::new(NoopImageCache)),
         ImageCacheBackend::Sqlite => Ok(Arc::new(
             SqliteImageCache::new(
                 &config.sqlite_path,
@@ -35,6 +36,27 @@ pub async fn build_image_cache(config: &Config) -> Result<Arc<dyn ImageCacheStor
             .await?,
         )),
         ImageCacheBackend::S3 => Ok(Arc::new(S3ImageCache::new(config).await?)),
+    }
+}
+
+pub struct NoopImageCache;
+
+#[async_trait]
+impl ImageCacheStore for NoopImageCache {
+    async fn get(&self, _key: &str, _object_key: &str) -> Result<Option<ImageCacheHit>, AppError> {
+        Ok(None)
+    }
+
+    async fn put(&self, entry: ImageCacheWrite) -> Result<ImageCacheHit, AppError> {
+        Ok(ImageCacheHit::Inline(CachedImage {
+            bytes: entry.bytes,
+            content_type: entry.content_type,
+            optimized: entry.optimized,
+        }))
+    }
+
+    fn label(&self) -> &'static str {
+        "none"
     }
 }
 

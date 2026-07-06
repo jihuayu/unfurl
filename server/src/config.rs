@@ -4,12 +4,14 @@ use crate::error::AppError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheBackend {
+    None,
     Sqlite,
     Redis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageCacheBackend {
+    None,
     Sqlite,
     S3,
 }
@@ -49,32 +51,36 @@ impl Config {
     pub fn from_env() -> Result<Self, AppError> {
         let low_memory_mode = parse_env_bool("LOW_MEMORY_MODE", false);
         let cache_backend = match env::var("CACHE_BACKEND")
-            .unwrap_or_else(|_| "sqlite".to_string())
+            .unwrap_or_else(|_| "none".to_string())
             .to_lowercase()
             .as_str()
         {
+            "none" | "off" | "disabled" => CacheBackend::None,
             "sqlite" => CacheBackend::Sqlite,
             "redis" => CacheBackend::Redis,
             other => {
                 return Err(AppError::new(
                     axum::http::StatusCode::BAD_REQUEST,
                     "INVALID_CACHE_BACKEND",
-                    format!("Unsupported cache backend: {other}"),
+                    format!("Unsupported cache backend: {other}; expected none, sqlite, or redis"),
                 ));
             }
         };
         let image_cache_backend = match env::var("IMAGE_CACHE_BACKEND")
-            .unwrap_or_else(|_| "sqlite".to_string())
+            .unwrap_or_else(|_| "none".to_string())
             .to_lowercase()
             .as_str()
         {
+            "none" | "off" | "disabled" => ImageCacheBackend::None,
             "sqlite" => ImageCacheBackend::Sqlite,
             "s3" => ImageCacheBackend::S3,
             other => {
                 return Err(AppError::new(
                     axum::http::StatusCode::BAD_REQUEST,
                     "INVALID_IMAGE_CACHE_BACKEND",
-                    format!("Unsupported image cache backend: {other}"),
+                    format!(
+                        "Unsupported image cache backend: {other}; expected none, sqlite, or s3"
+                    ),
                 ));
             }
         };
@@ -111,7 +117,7 @@ impl Config {
             port: parse_env_u16("PORT", 8080)?,
             low_memory_mode,
             api_response_cache_ttl: parse_env_u64("API_RESPONSE_CACHE_TTL", 3600)?,
-            image_cache_ttl: parse_env_u64("IMAGE_CACHE_TTL", 86400)?,
+            image_cache_ttl: parse_env_u64("IMAGE_CACHE_TTL", 604800)?,
             og_cache_ttl: parse_env_u64("OG_CACHE_TTL", 43200)?,
             fetch_timeout_ms: parse_env_u64("FETCH_TIMEOUT_MS", 8000)?,
             api_miss_max_concurrency: parse_env_usize(

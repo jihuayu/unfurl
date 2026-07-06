@@ -7,7 +7,7 @@ It keeps the same public routes as the Worker version:
 - `GET|HEAD /api`
 - `GET|HEAD /proxy/image`
 
-Default metadata and image cache backend is SQLite. Redis is optional for metadata, and S3 is optional for processed image cache.
+Default metadata and image cache backend is disabled so the service can sit behind an external CDN cache. SQLite and Redis are optional for metadata, and S3 is optional for processed image cache.
 Image proxying and basic transform/format negotiation are handled inside the server.
 
 ## Features
@@ -15,14 +15,14 @@ Image proxying and basic transform/format negotiation are handled inside the ser
 - Compatible JSON response shape with the Worker version
 - OG/Twitter/meta extraction from `<head>` only
 - Public URL validation with SSRF guardrails
-- SQLite cache by default
-- Redis cache via environment switch
+- No local cache by default
+- Optional SQLite or Redis metadata cache via environment switch
 - Image proxy with:
   - width/height resize
   - `fit` modes
   - `auto` format negotiation
   - forced `referer` from query param
-  - processed image cache in SQLite by default
+  - optional SQLite-backed processed image cache
   - optional S3-backed processed image cache with `302` redirect to public object URL
 - OTLP trace export support
 - Docker deployment support
@@ -57,12 +57,12 @@ Environment variables:
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8080` | Listen port |
 | `LOW_MEMORY_MODE` | `false` | Enable aggressive low-memory defaults and external image worker processing |
-| `CACHE_BACKEND` | `sqlite` | Metadata cache backend: `sqlite` or `redis` |
-| `IMAGE_CACHE_BACKEND` | `sqlite` | Processed image cache backend: `sqlite` or `s3` |
+| `CACHE_BACKEND` | `none` | Metadata cache backend: `none`, `sqlite`, or `redis` |
+| `IMAGE_CACHE_BACKEND` | `none` | Processed image cache backend: `none`, `sqlite`, or `s3` |
 | `SQLITE_PATH` | `/data/unfurl.db` | SQLite file path |
 | `REDIS_URL` | empty | Required when `CACHE_BACKEND=redis` |
 | `API_RESPONSE_CACHE_TTL` | `3600` | Browser/API JSON cache TTL |
-| `IMAGE_CACHE_TTL` | `86400` | Browser image cache TTL |
+| `IMAGE_CACHE_TTL` | `604800` | Browser/CDN image cache TTL |
 | `OG_CACHE_TTL` | `43200` | Metadata cache TTL |
 | `FETCH_TIMEOUT_MS` | `8000` | Upstream fetch timeout |
 | `API_MISS_MAX_CONCURRENCY` | dynamic | Maximum concurrent `/api` cache misses |
@@ -89,8 +89,10 @@ Environment variables:
 A sample env file is provided at `.env.example`.
 
 Cache behavior:
-- OG metadata is cached by `CACHE_BACKEND`
-- processed `/proxy/image` output is cached by `IMAGE_CACHE_BACKEND`
+- when `CACHE_BACKEND=none`, OG metadata is not cached locally
+- when `IMAGE_CACHE_BACKEND=none`, processed `/proxy/image` output is returned without local persistence
+- when `CACHE_BACKEND=sqlite` or `CACHE_BACKEND=redis`, OG metadata is cached by `CACHE_BACKEND`
+- when `IMAGE_CACHE_BACKEND=sqlite` or `IMAGE_CACHE_BACKEND=s3`, processed `/proxy/image` output is cached by `IMAGE_CACHE_BACKEND`
 - when `IMAGE_CACHE_BACKEND=sqlite`, the server returns cached image bytes directly
 - when `IMAGE_CACHE_BACKEND=s3`, the server uploads processed bytes to S3 and returns `302 Found` to `S3_PUBLIC_BASE_URL/<object-key>`
 - cache hit and miss paths are isolated with dedicated miss limiters, so heavy miss traffic does not consume the same execution slots as fast cache hits
@@ -140,14 +142,14 @@ cargo test
 
 ## Docker Deployment
 
-### Option 1: SQLite only
+### Option 1: No local cache
 
 Build and run:
 
 ```bash
 cd server
 docker build -t unfurl-server .
-docker run --rm -p 8080:8080 -v %cd%/data:/data unfurl-server
+docker run --rm -p 8080:8080 unfurl-server
 ```
 
 Linux/macOS shell equivalent:
@@ -155,14 +157,14 @@ Linux/macOS shell equivalent:
 ```bash
 cd server
 docker build -t unfurl-server .
-docker run --rm -p 8080:8080 -v "$(pwd)/data:/data" unfurl-server
+docker run --rm -p 8080:8080 unfurl-server
 ```
 
 Notes:
-- SQLite database is stored at `/data/unfurl.db`
-- Mount `/data` if you want cache persistence across restarts
+- This is the default mode and is intended for deployments behind an external CDN cache
+- Set `CACHE_BACKEND=sqlite` or `IMAGE_CACHE_BACKEND=sqlite` and mount `/data` if you want local cache persistence
 
-### Option 2: Docker Compose with SQLite
+### Option 2: Docker Compose
 
 ```bash
 cd server
@@ -211,7 +213,7 @@ docker run --rm -p 8080:8080 \
 Notes:
 - `S3_PUBLIC_BASE_URL` must point to a publicly fetchable preview/CDN path
 - `/proxy/image` will answer with `302` after S3 hit or upload success
-- SQLite is still used for metadata cache unless `CACHE_BACKEND=redis`
+- Metadata cache remains disabled unless `CACHE_BACKEND=sqlite` or `CACHE_BACKEND=redis`
 
 ### Option 5: Docker with low-memory mode
 
@@ -226,8 +228,8 @@ docker run --rm -p 8080:8080 \
 Behavior:
 - lower idle HTTP pool size
 - shorter idle HTTP timeout
-- SQLite metadata/image pools reduced to `1`
-- shorter SQLite idle timeout
+- SQLite metadata/image pools reduced to `1` when SQLite backends are enabled
+- shorter SQLite idle timeout when SQLite backends are enabled
 - image transforms handled by the bundled `image_worker` process on demand
 
 ### Option 6: Docker with OTLP collector
@@ -257,6 +259,7 @@ The server uses these headers to build image proxy URLs returned by `/api`.
 
 ### Persistence
 
+- `none` mode: no app-local cache persistence
 - SQLite mode: persist `/data`
 - Redis mode: persistence depends on your Redis configuration, not the app container
 

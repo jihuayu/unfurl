@@ -6,7 +6,8 @@ services:
     env_file:
       - .env.example
     environment:
-      CACHE_BACKEND: ${CACHE_BACKEND:-sqlite}
+      CACHE_BACKEND: ${CACHE_BACKEND:-none}
+      IMAGE_CACHE_BACKEND: ${IMAGE_CACHE_BACKEND:-none}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     volumes:
       - ./data:/data
