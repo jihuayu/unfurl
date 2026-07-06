@@ -21,9 +21,9 @@ use crate::{
     utils::{
         build_image_proxy_url, build_processed_image_cache_key, build_processed_image_object_key,
         build_unfurl_cache_key, choose_image_format, clamp_quality, ensure_image_content_type,
-        error_response, health_response, parse_boolean_param, parse_image_fit, parse_image_format,
-        parse_number_param, parse_optional_number_param, request_origin, strip_body_for_head,
-        success_response, validate_public_url,
+        error_response, health_response, normalize_target_url, parse_boolean_param,
+        parse_image_fit, parse_image_format, parse_number_param, parse_optional_number_param,
+        request_origin, strip_body_for_head, success_response, validate_public_url,
     },
 };
 
@@ -94,7 +94,7 @@ async fn unfurl_inner(
         timings.cache_read_ms = Some(elapsed_ms(cache_lookup_started_at));
     }
 
-    let target_url = validate_public_url(raw_target_url)?.to_string();
+    let target_url = normalize_target_url(raw_target_url)?;
     let _miss_permit = state
         .api_miss_limiter
         .clone()

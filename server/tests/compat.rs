@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 use tower::ServiceExt;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{header as match_header, method, path},
+    matchers::{header as match_header, method, path, query_param},
 };
 
 use unfurl_server::{
@@ -193,6 +193,54 @@ async fn api_returns_metadata_then_hits_cache() {
             .contains("cache-read")
     );
     assert_eq!(second_json["data"]["title"], "Example Title");
+}
+
+#[tokio::test]
+async fn api_fetches_normalized_target_url() {
+    let upstream = MockServer::start().await;
+    let local_page_url = format!("{}/page", upstream.uri());
+    let page_url = local_page_url
+        .replace("127.0.0.1", "mock.example.test")
+        .replace("localhost", "mock.example.test");
+    Mock::given(method("GET"))
+        .and(path("/page"))
+        .and(query_param("a", "1"))
+        .and(query_param("b", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<!doctype html><html><head><title>Normalized</title></head></html>",
+            "text/html; charset=utf-8",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let app = build_test_app(
+        temp_dir.path().join("cache.db"),
+        "mock.example.test",
+        &local_page_url,
+    )
+    .await;
+    let raw_url = format!("{page_url}/?utm_source=newsletter&b=2&a=1");
+    let encoded = urlencoding::encode(&raw_url).into_owned();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api?url={encoded}"))
+                .header(header::HOST, "service.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["data"]["title"], "Normalized");
+    assert_eq!(json["data"]["url"], format!("{page_url}?a=1&b=2"));
 }
 
 #[tokio::test]
