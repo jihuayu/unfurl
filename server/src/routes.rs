@@ -32,10 +32,38 @@ pub fn router() -> Router<AppState> {
         .route("/health", get(health))
         .route("/api", get(unfurl))
         .route("/proxy/image", get(image_proxy))
+        .fallback(route_not_found)
+        .method_not_allowed_fallback(method_not_allowed)
 }
 
 async fn health(method: Method) -> impl IntoResponse {
     strip_body_for_head(&method, health_response(Instant::now()))
+}
+
+async fn route_not_found(method: Method) -> Response<Body> {
+    let started_at = Instant::now();
+    strip_body_for_head(
+        &method,
+        error_response(
+            AppError::new(StatusCode::NOT_FOUND, "NOT_FOUND", "Route not found"),
+            started_at,
+        ),
+    )
+}
+
+async fn method_not_allowed(method: Method) -> Response<Body> {
+    let started_at = Instant::now();
+    strip_body_for_head(
+        &method,
+        error_response(
+            AppError::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "METHOD_NOT_ALLOWED",
+                "Only GET and HEAD are supported",
+            ),
+            started_at,
+        ),
+    )
 }
 
 async fn unfurl(

@@ -295,6 +295,75 @@ async fn api_head_returns_empty_body() {
 }
 
 #[tokio::test]
+async fn unknown_route_returns_json_error() {
+    let temp_dir = TempDir::new().unwrap();
+    let app = build_app_with_client(
+        test_config(temp_dir.path().join("cache.db")),
+        reqwest::Client::new(),
+    )
+    .await
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/missing")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "application/json; charset=utf-8"
+    );
+    assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(json["status"], "error");
+    assert_eq!(json["error"]["code"], "NOT_FOUND");
+}
+
+#[tokio::test]
+async fn unsupported_method_returns_json_error() {
+    let temp_dir = TempDir::new().unwrap();
+    let app = build_app_with_client(
+        test_config(temp_dir.path().join("cache.db")),
+        reqwest::Client::new(),
+    )
+    .await
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "application/json; charset=utf-8"
+    );
+    assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(json["status"], "error");
+    assert_eq!(json["error"]["code"], "METHOD_NOT_ALLOWED");
+}
+
+#[tokio::test]
 async fn image_proxy_forces_query_referer_and_caches_processed_image() {
     let upstream = MockServer::start().await;
     let png_body = sample_png();
