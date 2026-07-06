@@ -1,13 +1,8 @@
-node_modules/
-.wrangler/
 .claude/
 coverage/
-dist/
-.dev.vars
 .env
 .env.*
 !.env.example
 target/
 server/data/
 server/.env
-

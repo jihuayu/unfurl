@@ -1,8 +1,8 @@
 # Unfurl Server
 
-A standalone Rust server version of `unfurl` that does not depend on Cloudflare.
+A standalone Rust server for unfurling URL metadata.
 
-It keeps the same public routes as the Worker version:
+It exposes these public routes:
 - `GET|HEAD /health`
 - `GET|HEAD /api`
 - `GET|HEAD /proxy/image`
@@ -12,7 +12,7 @@ Image proxying and basic transform/format negotiation are handled inside the ser
 
 ## Features
 
-- Compatible JSON response shape with the Worker version
+- Stable JSON response envelope
 - OG/Twitter/meta extraction from `<head>` only
 - Public URL validation with SSRF guardrails
 - No local cache by default
@@ -402,9 +402,9 @@ Notes:
 - traffic mix is `50% /api` and `50% /proxy/image`
 - CPU and memory are sampled at the benchmark process level, so they include the app server, mock upstream, and load generator
 
-## Compatibility Notes
+## API Guarantees
 
-This server intentionally mirrors the current Worker behavior in the following areas:
+The server keeps these public API guarantees:
 - JSON response envelope
 - route names
 - cache header defaults
@@ -416,7 +416,7 @@ This server intentionally mirrors the current Worker behavior in the following a
 
 - No auth or rate limiting
 - SQLite mode is not designed for high-write clustered deployments
-- Image transforms use the Rust `image` crate; behavior is practical and compatible, but not byte-identical to Cloudflare Image Resizing
+- Image transforms use the Rust `image` crate; behavior is practical, but not byte-identical to managed edge image services
 - Current OTLP support exports traces only, not metrics or logs
 
 ## Suggested Production Setup
