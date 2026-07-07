@@ -128,18 +128,16 @@ impl SqliteCache {
 impl CacheStore for SqliteCache {
     async fn get(&self, key: &str) -> Result<Option<CacheRead>, AppError> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        let row = sqlx::query(
-            "SELECT payload_json FROM unfurl_cache WHERE cache_key = ?1 AND expires_at > ?2",
-        )
-        .bind(key)
-        .bind(now)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT payload_json, expires_at FROM unfurl_cache WHERE cache_key = ?1")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
 
         match row {
             Some(row) => Ok(Some(CacheRead {
                 envelope: serde_json::from_str(row.try_get::<&str, _>("payload_json")?)?,
-                is_stale: false,
+                is_stale: row.try_get::<i64, _>("expires_at")? <= now,
             })),
             None => Ok(None),
         }

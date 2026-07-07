@@ -127,10 +127,9 @@ impl ImageCacheStore for SqliteImageCache {
     async fn get(&self, key: &str, _object_key: &str) -> Result<Option<ImageCacheRead>, AppError> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let row = sqlx::query(
-            "SELECT content_type, image_bytes, optimized FROM image_cache WHERE cache_key = ?1 AND expires_at > ?2",
+            "SELECT content_type, image_bytes, optimized, expires_at FROM image_cache WHERE cache_key = ?1",
         )
         .bind(key)
-        .bind(now)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -141,7 +140,7 @@ impl ImageCacheStore for SqliteImageCache {
                     bytes: Bytes::from(row.try_get::<Vec<u8>, _>("image_bytes")?),
                     optimized: row.try_get::<i64, _>("optimized")? == 1,
                 }),
-                is_stale: false,
+                is_stale: row.try_get::<i64, _>("expires_at")? <= now,
             })),
             None => Ok(None),
         }
