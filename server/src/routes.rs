@@ -16,14 +16,15 @@ use crate::{
     fetcher::fetch_page,
     image_proxy::process_image,
     image_worker::process_image_with_helper,
-    models::{CacheStatus, ImageCacheHit, ImageCacheWrite, ImageRequest},
+    models::{CacheStatus, ImageCacheHit, ImageCacheWrite, ImageFormat, ImageRequest, UnfurlData},
     state::AppState,
     utils::{
-        build_image_proxy_url, build_processed_image_cache_key, build_processed_image_object_key,
-        build_unfurl_cache_key, choose_image_format, clamp_quality, ensure_image_content_type,
-        error_response, health_response, normalize_target_url, parse_boolean_param,
-        parse_image_fit, parse_image_format, parse_number_param, parse_optional_number_param,
-        request_origin, strip_body_for_head, success_response, validate_public_url,
+        DEFAULT_IMAGE_FIT, DEFAULT_IMAGE_QUALITY, build_image_proxy_url_for_request,
+        build_processed_image_cache_key, build_processed_image_object_key, build_unfurl_cache_key,
+        choose_image_format, clamp_quality, ensure_image_content_type, error_response,
+        health_response, normalize_target_url, parse_boolean_param, parse_image_fit,
+        parse_image_format, parse_number_param, parse_optional_number_param, request_origin,
+        strip_body_for_head, success_response, validate_public_url,
     },
 };
 
@@ -111,6 +112,28 @@ async fn unfurl_inner(
         let cache_lookup_started_at = Instant::now();
         if let Some(read) = state.cache.get(&cache_key).await? {
             timings.cache_read_ms = Some(elapsed_ms(cache_lookup_started_at));
+            if read.is_stale {
+                let target_url = normalize_target_url(raw_target_url)?;
+                let origin = request_origin(&headers);
+                spawn_unfurl_cache_refresh(
+                    state.clone(),
+                    cache_key.clone(),
+                    target_url,
+                    origin,
+                    ttl,
+                );
+                return Ok(success_response(
+                    read.envelope.data,
+                    CacheStatus::Hit,
+                    started_at,
+                    state.config.api_response_cache_ttl,
+                    &[
+                        ("x-cache-source", state.cache.label()),
+                        ("x-cache-stale", "1"),
+                        ("x-cache-refresh", "async"),
+                    ],
+                ));
+            }
             return Ok(success_response(
                 read.envelope.data,
                 CacheStatus::Hit,
@@ -123,6 +146,46 @@ async fn unfurl_inner(
     }
 
     let target_url = normalize_target_url(raw_target_url)?;
+    let origin = request_origin(&headers);
+    let data = fetch_and_store_unfurl(&state, &cache_key, &target_url, &origin, ttl, Some(timings))
+        .await?;
+    Ok(success_response(
+        data,
+        CacheStatus::Miss,
+        started_at,
+        state.config.api_response_cache_ttl,
+        &[("x-cache-source", "origin")],
+    ))
+}
+
+fn spawn_unfurl_cache_refresh(
+    state: AppState,
+    cache_key: String,
+    target_url: String,
+    origin: String,
+    ttl: u64,
+) {
+    tokio::spawn(async move {
+        if let Err(error) =
+            fetch_and_store_unfurl(&state, &cache_key, &target_url, &origin, ttl, None).await
+        {
+            tracing::warn!(
+                error = ?error,
+                target_url,
+                "async metadata cache refresh failed"
+            );
+        }
+    });
+}
+
+async fn fetch_and_store_unfurl(
+    state: &AppState,
+    cache_key: &str,
+    target_url: &str,
+    origin: &str,
+    ttl: u64,
+    mut timings: Option<&mut RequestTimings>,
+) -> Result<UnfurlData, AppError> {
     let _miss_permit = state
         .api_miss_limiter
         .clone()
@@ -131,8 +194,10 @@ async fn unfurl_inner(
         .map_err(|_| AppError::internal_with_message("api miss limiter closed"))?;
     let fetch_started_at = Instant::now();
     let upstream_response =
-        fetch_page(&state.client, &target_url, state.config.fetch_timeout_ms).await?;
-    timings.fetch_upstream_ms = Some(elapsed_ms(fetch_started_at));
+        fetch_page(&state.client, target_url, state.config.fetch_timeout_ms).await?;
+    if let Some(timings) = timings.as_mut() {
+        timings.fetch_upstream_ms = Some(elapsed_ms(fetch_started_at));
+    }
     let status = StatusCode::from_u16(upstream_response.status().as_u16())
         .unwrap_or(StatusCode::BAD_GATEWAY);
     if !upstream_response.status().is_success() {
@@ -165,26 +230,63 @@ async fn unfurl_inner(
         )
     })?;
     let metadata = extract_head_metadata(&html);
-    let mut data = merge_meta_tags(&metadata, &target_url);
-    let origin = request_origin(&headers);
-
-    if let Some(image) = data.image.as_mut() {
-        image.proxy = Some(build_image_proxy_url(&origin, &image.url, &target_url));
-    }
-    if let Some(logo) = data.logo.as_mut() {
-        logo.proxy = Some(build_image_proxy_url(&origin, &logo.url, &target_url));
-    }
+    let mut data = merge_meta_tags(&metadata, target_url);
+    rewrite_assets_to_local_proxy_and_warm_cache(state, &mut data, origin, target_url);
 
     let cache_write_started_at = Instant::now();
-    state.cache.set(&cache_key, &data, ttl).await?;
-    timings.cache_write_ms = Some(elapsed_ms(cache_write_started_at));
-    Ok(success_response(
-        data,
-        CacheStatus::Miss,
-        started_at,
-        state.config.api_response_cache_ttl,
-        &[("x-cache-source", "origin")],
-    ))
+    state.cache.set(cache_key, &data, ttl).await?;
+    if let Some(timings) = timings.as_mut() {
+        timings.cache_write_ms = Some(elapsed_ms(cache_write_started_at));
+    }
+    Ok(data)
+}
+
+fn rewrite_assets_to_local_proxy_and_warm_cache(
+    state: &AppState,
+    data: &mut UnfurlData,
+    origin: &str,
+    referer_url: &str,
+) {
+    let mut warm_targets = Vec::new();
+    let image_request = metadata_image_request();
+
+    if let Some(image) = data.image.as_mut() {
+        let source_url = image.url.clone();
+        let local_url =
+            build_image_proxy_url_for_request(origin, &source_url, referer_url, &image_request);
+        image.url = local_url.clone();
+        image.proxy = Some(local_url);
+        warm_targets.push(source_url);
+    }
+    if let Some(logo) = data.logo.as_mut() {
+        let source_url = logo.url.clone();
+        let local_url =
+            build_image_proxy_url_for_request(origin, &source_url, referer_url, &image_request);
+        logo.url = local_url.clone();
+        logo.proxy = Some(local_url);
+        if !warm_targets.contains(&source_url) {
+            warm_targets.push(source_url);
+        }
+    }
+
+    for target_url in warm_targets {
+        spawn_image_cache_warm_if_needed(
+            state.clone(),
+            target_url,
+            Some(referer_url.to_string()),
+            image_request.clone(),
+        );
+    }
+}
+
+fn metadata_image_request() -> ImageRequest {
+    ImageRequest {
+        width: None,
+        height: None,
+        quality: DEFAULT_IMAGE_QUALITY,
+        format: ImageFormat::Jpeg,
+        fit: DEFAULT_IMAGE_FIT,
+    }
 }
 
 async fn image_proxy(
@@ -265,30 +367,118 @@ async fn image_proxy_inner(
         format: negotiated_format.clone(),
         fit,
     };
-    let image_cache_key =
-        build_processed_image_cache_key(&target_url, referer.as_deref(), &image_request);
-    let image_object_key = build_processed_image_object_key(
-        &state.config.s3_prefix,
-        &image_cache_key,
-        &negotiated_format,
-    );
+    let cache_target = build_image_cache_target(&state, target_url, referer, image_request);
 
     let cache_lookup_started_at = Instant::now();
     if let Some(read) = state
         .image_cache
-        .get(&image_cache_key, &image_object_key)
+        .get(&cache_target.cache_key, &cache_target.object_key)
         .await?
     {
         timings.cache_read_ms = Some(elapsed_ms(cache_lookup_started_at));
+        if read.is_stale {
+            spawn_image_cache_refresh(state.clone(), cache_target);
+        }
         return image_cache_hit_response(
             read.hit,
             state.config.image_cache_ttl,
             CacheStatus::Hit,
             state.image_cache.label(),
+            read.is_stale,
         );
     }
     timings.cache_read_ms = Some(elapsed_ms(cache_lookup_started_at));
 
+    let cached = fetch_and_store_image(&state, cache_target, Some(timings)).await?;
+
+    image_cache_hit_response(
+        cached,
+        state.config.image_cache_ttl,
+        CacheStatus::Miss,
+        "origin",
+        false,
+    )
+}
+
+#[derive(Clone)]
+struct ImageCacheTarget {
+    target_url: String,
+    referer: Option<String>,
+    request: ImageRequest,
+    cache_key: String,
+    object_key: String,
+}
+
+fn build_image_cache_target(
+    state: &AppState,
+    target_url: String,
+    referer: Option<String>,
+    request: ImageRequest,
+) -> ImageCacheTarget {
+    let cache_key = build_processed_image_cache_key(&target_url, referer.as_deref(), &request);
+    let object_key =
+        build_processed_image_object_key(&state.config.s3_prefix, &cache_key, &request.format);
+    ImageCacheTarget {
+        target_url,
+        referer,
+        request,
+        cache_key,
+        object_key,
+    }
+}
+
+fn spawn_image_cache_refresh(state: AppState, target: ImageCacheTarget) {
+    tokio::spawn(async move {
+        let target_url = target.target_url.clone();
+        if let Err(error) = fetch_and_store_image(&state, target, None).await {
+            tracing::warn!(
+                error = ?error,
+                target_url,
+                "async image cache refresh failed"
+            );
+        }
+    });
+}
+
+fn spawn_image_cache_warm_if_needed(
+    state: AppState,
+    target_url: String,
+    referer: Option<String>,
+    request: ImageRequest,
+) {
+    tokio::spawn(async move {
+        let target = build_image_cache_target(&state, target_url.clone(), referer, request);
+        match state
+            .image_cache
+            .get(&target.cache_key, &target.object_key)
+            .await
+        {
+            Ok(Some(read)) if !read.is_stale => {}
+            Ok(_) => {
+                if let Err(error) = fetch_and_store_image(&state, target, None).await {
+                    tracing::warn!(
+                        error = ?error,
+                        target_url,
+                        "metadata image cache warm failed"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = ?error,
+                    target_url,
+                    "metadata image cache lookup failed"
+                );
+            }
+        }
+    });
+}
+
+async fn fetch_and_store_image(
+    state: &AppState,
+    target: ImageCacheTarget,
+    mut timings: Option<&mut RequestTimings>,
+) -> Result<ImageCacheHit, AppError> {
     let _miss_permit = state
         .image_miss_limiter
         .clone()
@@ -296,11 +486,11 @@ async fn image_proxy_inner(
         .await
         .map_err(|_| AppError::internal_with_message("image miss limiter closed"))?;
     let fetch_started_at = Instant::now();
-    let mut request = state.client.get(&target_url).header(
+    let mut request = state.client.get(&target.target_url).header(
         header::ACCEPT,
         "image/avif,image/webp,image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5",
     );
-    if let Some(referer) = referer.as_deref() {
+    if let Some(referer) = target.referer.as_deref() {
         request = request.header(header::REFERER, referer);
     }
     let upstream_response = request
@@ -316,7 +506,9 @@ async fn image_proxy_inner(
                 format!("Unable to fetch image: {error}"),
             )
         })?;
-    timings.fetch_upstream_ms = Some(elapsed_ms(fetch_started_at));
+    if let Some(timings) = timings.as_mut() {
+        timings.fetch_upstream_ms = Some(elapsed_ms(fetch_started_at));
+    }
     let status = StatusCode::from_u16(upstream_response.status().as_u16())
         .unwrap_or(StatusCode::BAD_GATEWAY);
     if !upstream_response.status().is_success() {
@@ -347,12 +539,12 @@ async fn image_proxy_inner(
             state.config.image_worker_bin.as_ref(),
             &bytes,
             &content_type,
-            &image_request,
+            &target.request,
             state.config.fetch_timeout_ms,
         )
         .await?
     } else {
-        let request_for_transform = image_request.clone();
+        let request_for_transform = target.request.clone();
         let content_type_for_transform = content_type.clone();
         let bytes_for_transform = bytes.to_vec();
         tokio::task::spawn_blocking(move || {
@@ -367,28 +559,27 @@ async fn image_proxy_inner(
             AppError::internal_with_message(format!("image transform task join failed: {error}"))
         })??
     };
-    timings.transform_ms = Some(elapsed_ms(transform_started_at));
+    if let Some(timings) = timings.as_mut() {
+        timings.transform_ms = Some(elapsed_ms(transform_started_at));
+    }
 
     let cache_write_started_at = Instant::now();
     let cached = state
         .image_cache
         .put(ImageCacheWrite {
-            cache_key: image_cache_key,
-            object_key: image_object_key,
+            cache_key: target.cache_key,
+            object_key: target.object_key,
             bytes: Bytes::from(processed.bytes),
             content_type: processed.content_type,
             optimized: processed.optimized,
             ttl: state.config.image_cache_ttl,
         })
         .await?;
-    timings.cache_write_ms = Some(elapsed_ms(cache_write_started_at));
+    if let Some(timings) = timings.as_mut() {
+        timings.cache_write_ms = Some(elapsed_ms(cache_write_started_at));
+    }
 
-    image_cache_hit_response(
-        cached,
-        state.config.image_cache_ttl,
-        CacheStatus::Miss,
-        "origin",
-    )
+    Ok(cached)
 }
 
 fn image_cache_hit_response(
@@ -396,6 +587,7 @@ fn image_cache_hit_response(
     image_cache_ttl: u64,
     cache_status: CacheStatus,
     cache_source: &str,
+    is_stale: bool,
 ) -> Result<Response<Body>, AppError> {
     match hit {
         ImageCacheHit::Inline(image) => {
@@ -442,6 +634,10 @@ fn image_cache_hit_response(
                     ))
                 })?,
             );
+            if is_stale {
+                headers.insert("x-cache-stale", header::HeaderValue::from_static("1"));
+                headers.insert("x-cache-refresh", header::HeaderValue::from_static("async"));
+            }
             Ok(response)
         }
         ImageCacheHit::Redirect { location } => {
@@ -483,6 +679,10 @@ fn image_cache_hit_response(
                     ))
                 })?,
             );
+            if is_stale {
+                headers.insert("x-cache-stale", header::HeaderValue::from_static("1"));
+                headers.insert("x-cache-refresh", header::HeaderValue::from_static("async"));
+            }
             Ok(response)
         }
     }

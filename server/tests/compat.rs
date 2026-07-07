@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -6,8 +11,9 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
+use sqlx::{Row, sqlite::SqlitePoolOptions};
 use tempfile::TempDir;
-use tokio::sync::Semaphore;
+use tokio::{sync::Semaphore, time::sleep};
 use tower::ServiceExt;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -97,6 +103,96 @@ fn sample_html(image_url: &str) -> String {
     )
 }
 
+fn sqlite_url(path: &Path) -> String {
+    format!("sqlite://{}", path.to_string_lossy().replace('\\', "/"))
+}
+
+async fn image_cache_row_count(sqlite_path: &Path) -> i64 {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&sqlite_url(sqlite_path))
+        .await
+        .unwrap();
+    let row = sqlx::query("SELECT COUNT(*) AS count FROM image_cache")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    row.try_get::<i64, _>("count").unwrap()
+}
+
+async fn wait_for_image_cache_rows(sqlite_path: &Path, expected_minimum: i64) {
+    let mut last_count = 0;
+    for _ in 0..100 {
+        last_count = image_cache_row_count(sqlite_path).await;
+        if last_count >= expected_minimum {
+            return;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    panic!("image cache reached {last_count} rows, expected {expected_minimum}");
+}
+
+async fn expire_cache_table(sqlite_path: &Path, table: &str) {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&sqlite_url(sqlite_path))
+        .await
+        .unwrap();
+    let statement = format!("UPDATE {table} SET expires_at = 0");
+    sqlx::query(&statement).execute(&pool).await.unwrap();
+}
+
+async fn cached_metadata_title(sqlite_path: &Path) -> Option<String> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&sqlite_url(sqlite_path))
+        .await
+        .unwrap();
+    let row = sqlx::query("SELECT payload_json FROM unfurl_cache LIMIT 1")
+        .fetch_optional(&pool)
+        .await
+        .unwrap()?;
+    let payload = row.try_get::<&str, _>("payload_json").unwrap();
+    let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+    value["data"]["title"].as_str().map(ToOwned::to_owned)
+}
+
+async fn cached_image_bytes(sqlite_path: &Path) -> Option<Vec<u8>> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&sqlite_url(sqlite_path))
+        .await
+        .unwrap();
+    let row = sqlx::query("SELECT image_bytes FROM image_cache LIMIT 1")
+        .fetch_optional(&pool)
+        .await
+        .unwrap()?;
+    Some(row.try_get::<Vec<u8>, _>("image_bytes").unwrap())
+}
+
+async fn wait_for_cached_metadata_title(sqlite_path: &Path, expected: &str) {
+    for _ in 0..100 {
+        if cached_metadata_title(sqlite_path).await.as_deref() == Some(expected) {
+            return;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    panic!("metadata cache did not refresh to title {expected}");
+}
+
+async fn wait_for_cached_image_change(sqlite_path: &Path, previous: &[u8]) {
+    for _ in 0..100 {
+        if cached_image_bytes(sqlite_path)
+            .await
+            .is_some_and(|bytes| bytes != previous)
+        {
+            return;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    panic!("image cache did not refresh");
+}
+
 #[tokio::test]
 async fn api_returns_metadata_then_hits_cache() {
     let upstream = MockServer::start().await;
@@ -160,12 +256,21 @@ async fn api_returns_metadata_then_hits_cache() {
     assert_eq!(first_json["status"], "success");
     assert_eq!(first_json["data"]["title"], "Example Title");
     assert_eq!(first_json["data"]["publisher"], "publisher");
+    let image_url = first_json["data"]["image"]["url"].as_str().unwrap();
+    let image_proxy = first_json["data"]["image"]["proxy"].as_str().unwrap();
+    assert_eq!(image_url, image_proxy);
+    assert!(image_url.starts_with("https://service.example/proxy/image?"));
     assert!(
-        first_json["data"]["image"]["proxy"]
-            .as_str()
-            .unwrap()
-            .contains("referer=")
+        image_url.contains("referer="),
+        "local image URL should keep the referer query for hotlink-protected origins"
     );
+    assert!(image_url.contains("f=jpeg"));
+    let logo_url = first_json["data"]["logo"]["url"].as_str().unwrap();
+    assert_eq!(
+        logo_url,
+        first_json["data"]["logo"]["proxy"].as_str().unwrap()
+    );
+    assert!(logo_url.contains("referer="));
 
     let second = app
         .oneshot(
@@ -195,6 +300,161 @@ async fn api_returns_metadata_then_hits_cache() {
             .contains("cache-read")
     );
     assert_eq!(second_json["data"]["title"], "Example Title");
+}
+
+#[tokio::test]
+async fn api_warms_image_and_icon_cache_with_page_referer() {
+    let upstream = MockServer::start().await;
+    let local_page_url = format!("{}/page", upstream.uri());
+    let page_url = local_page_url
+        .replace("127.0.0.1", "mock.example.test")
+        .replace("localhost", "mock.example.test");
+    let image_url = format!("{}/image.png", upstream.uri())
+        .replace("127.0.0.1", "mock.example.test")
+        .replace("localhost", "mock.example.test");
+    let page_body = sample_html(&image_url);
+    let png_body = sample_png();
+
+    Mock::given(method("GET"))
+        .and(path("/page"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(page_body, "text/html; charset=utf-8"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/image.png"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(png_body.clone()),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/favicon.png"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(png_body),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let sqlite_path = temp_dir.path().join("cache.db");
+    let app = build_test_app(sqlite_path.clone(), "mock.example.test", &local_page_url).await;
+    let url = urlencoding::encode(&page_url).into_owned();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api?url={url}"))
+                .header(header::HOST, "service.example")
+                .header("x-forwarded-proto", "https")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["data"]["image"]["url"]
+            .as_str()
+            .unwrap()
+            .contains("referer=")
+    );
+    assert!(
+        json["data"]["logo"]["url"]
+            .as_str()
+            .unwrap()
+            .contains("referer=")
+    );
+    wait_for_image_cache_rows(&sqlite_path, 2).await;
+
+    let requests = upstream.received_requests().await.unwrap();
+    for path in ["/image.png", "/favicon.png"] {
+        let request = requests
+            .iter()
+            .find(|request| request.url.path() == path)
+            .expect("metadata image warm request should reach upstream");
+        assert_eq!(
+            request.headers.get("referer").unwrap().to_str().unwrap(),
+            page_url.as_str(),
+            "metadata image warming should preserve the page referer for hotlink-protected origins"
+        );
+    }
+}
+
+#[tokio::test]
+async fn api_serves_stale_metadata_and_refreshes_async() {
+    let upstream = MockServer::start().await;
+    let local_page_url = format!("{}/page", upstream.uri());
+    let page_url = local_page_url
+        .replace("127.0.0.1", "mock.example.test")
+        .replace("localhost", "mock.example.test");
+
+    Mock::given(method("GET"))
+        .and(path("/page"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<!doctype html><html><head><title>Old Title</title></head></html>",
+            "text/html; charset=utf-8",
+        ))
+        .up_to_n_times(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/page"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<!doctype html><html><head><title>New Title</title></head></html>",
+            "text/html; charset=utf-8",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let sqlite_path = temp_dir.path().join("cache.db");
+    let app = build_test_app(sqlite_path.clone(), "mock.example.test", &local_page_url).await;
+    let url = urlencoding::encode(&page_url).into_owned();
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api?url={url}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    expire_cache_table(&sqlite_path, "unfurl_cache").await;
+
+    let stale = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api?url={url}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let stale_headers = stale.headers().clone();
+    let stale_body = stale.into_body().collect().await.unwrap().to_bytes();
+    let stale_json: serde_json::Value = serde_json::from_slice(&stale_body).unwrap();
+
+    assert_eq!(stale_headers.get("x-cache-status").unwrap(), "HIT");
+    assert_eq!(stale_headers.get("x-cache-stale").unwrap(), "1");
+    assert_eq!(stale_headers.get("x-cache-refresh").unwrap(), "async");
+    assert_eq!(stale_json["data"]["title"], "Old Title");
+    wait_for_cached_metadata_title(&sqlite_path, "New Title").await;
 }
 
 #[tokio::test]
@@ -492,6 +752,67 @@ async fn image_proxy_forces_query_referer_and_caches_processed_image() {
 }
 
 #[tokio::test]
+async fn image_proxy_serves_stale_image_and_refreshes_async() {
+    let upstream = MockServer::start().await;
+    let old_png = sample_png_with_color([255, 0, 0, 255]);
+    let new_png = sample_png_with_color([0, 0, 255, 255]);
+    let local_target_url = format!("{}/cover.png", upstream.uri());
+    let target_url = local_target_url
+        .replace("127.0.0.1", "image.example.test")
+        .replace("localhost", "image.example.test");
+
+    Mock::given(method("GET"))
+        .and(path("/cover.png"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(old_png.clone()),
+        )
+        .up_to_n_times(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/cover.png"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(new_png),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let sqlite_path = temp_dir.path().join("cache.db");
+    let app = build_test_app(sqlite_path.clone(), "image.example.test", &local_target_url).await;
+    let target = urlencoding::encode(&target_url).into_owned();
+    let request = || {
+        Request::builder()
+            .uri(format!("/proxy/image?url={target}&f=png"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let first = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.headers().get("x-cache-status").unwrap(), "MISS");
+    let first_body = first.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(first_body.as_ref(), old_png.as_slice());
+    let cached_before = cached_image_bytes(&sqlite_path).await.unwrap();
+    expire_cache_table(&sqlite_path, "image_cache").await;
+
+    let stale = app.oneshot(request()).await.unwrap();
+    let stale_headers = stale.headers().clone();
+    let stale_body = stale.into_body().collect().await.unwrap().to_bytes();
+
+    assert_eq!(stale_headers.get("x-cache-status").unwrap(), "HIT");
+    assert_eq!(stale_headers.get("x-cache-stale").unwrap(), "1");
+    assert_eq!(stale_headers.get("x-cache-refresh").unwrap(), "async");
+    assert_eq!(stale_body.as_ref(), cached_before.as_slice());
+    wait_for_cached_image_change(&sqlite_path, &cached_before).await;
+}
+
+#[tokio::test]
 async fn image_proxy_none_cache_backend_always_misses() {
     let upstream = MockServer::start().await;
     let png_body = sample_png();
@@ -625,7 +946,11 @@ async fn image_proxy_uses_external_worker_in_low_memory_mode() {
 }
 
 fn sample_png() -> Vec<u8> {
-    let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]));
+    sample_png_with_color([255, 0, 0, 255])
+}
+
+fn sample_png_with_color(color: [u8; 4]) -> Vec<u8> {
+    let image = image::RgbaImage::from_pixel(4, 4, image::Rgba(color));
     let mut cursor = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image)
         .write_to(&mut cursor, image::ImageFormat::Png)

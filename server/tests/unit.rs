@@ -3,7 +3,7 @@ use unfurl_server::{
     models::{ImageFit, ImageFormat, ImageRequest},
     utils::{
         build_processed_image_cache_key, build_processed_image_object_key, build_unfurl_cache_key,
-        choose_image_format,
+        choose_image_format, normalize_target_url,
     },
 };
 
@@ -12,6 +12,12 @@ fn cache_key_preserves_path_and_query_case() {
     let lower = build_unfurl_cache_key("https://Example.com/Post?Case=A").unwrap();
     let upper = build_unfurl_cache_key("https://example.com/post?case=A").unwrap();
     assert_ne!(lower, upper);
+}
+
+#[test]
+fn normalize_target_url_drops_empty_query_marker() {
+    let normalized = normalize_target_url("https://Example.com/Post").unwrap();
+    assert_eq!(normalized, "https://example.com/Post");
 }
 
 #[test]

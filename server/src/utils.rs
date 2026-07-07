@@ -351,9 +351,13 @@ pub fn normalize_target_url(raw_url: &str) -> Result<String, AppError> {
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect::<Vec<_>>();
     query_pairs.sort_by(|left, right| left.cmp(right));
-    url.query_pairs_mut().clear();
-    for (key, value) in query_pairs {
-        url.query_pairs_mut().append_pair(&key, &value);
+    if query_pairs.is_empty() {
+        url.set_query(None);
+    } else {
+        url.query_pairs_mut().clear();
+        for (key, value) in query_pairs {
+            url.query_pairs_mut().append_pair(&key, &value);
+        }
     }
 
     Ok(url.to_string())
@@ -413,6 +417,28 @@ pub fn build_image_proxy_url(origin: &str, asset_url: &str, referer_url: &str) -
         urlencoding::encode(asset_url),
         urlencoding::encode(referer_url)
     )
+}
+
+pub fn build_image_proxy_url_for_request(
+    origin: &str,
+    asset_url: &str,
+    referer_url: &str,
+    request: &ImageRequest,
+) -> String {
+    let mut query = vec![
+        format!("url={}", urlencoding::encode(asset_url)),
+        format!("referer={}", urlencoding::encode(referer_url)),
+        format!("q={}", request.quality),
+        format!("f={}", image_format_slug(&request.format)),
+        format!("fit={}", image_fit_slug(request.fit)),
+    ];
+    if let Some(width) = request.width {
+        query.push(format!("w={width}"));
+    }
+    if let Some(height) = request.height {
+        query.push(format!("h={height}"));
+    }
+    format!("{origin}/proxy/image?{}", query.join("&"))
 }
 
 pub fn build_processed_image_cache_key(
