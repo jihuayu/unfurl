@@ -51,7 +51,7 @@ impl Config {
     pub fn from_env() -> Result<Self, AppError> {
         let low_memory_mode = parse_env_bool("LOW_MEMORY_MODE", false);
         let cache_backend = match env::var("CACHE_BACKEND")
-            .unwrap_or_else(|_| "none".to_string())
+            .unwrap_or_else(|_| "sqlite".to_string())
             .to_lowercase()
             .as_str()
         {
@@ -67,7 +67,7 @@ impl Config {
             }
         };
         let image_cache_backend = match env::var("IMAGE_CACHE_BACKEND")
-            .unwrap_or_else(|_| "none".to_string())
+            .unwrap_or_else(|_| "sqlite".to_string())
             .to_lowercase()
             .as_str()
         {
@@ -117,8 +117,8 @@ impl Config {
             port: parse_env_u16("PORT", 8080)?,
             low_memory_mode,
             api_response_cache_ttl: parse_env_u64("API_RESPONSE_CACHE_TTL", 3600)?,
-            image_cache_ttl: parse_env_u64("IMAGE_CACHE_TTL", 604800)?,
-            og_cache_ttl: parse_env_u64("OG_CACHE_TTL", 43200)?,
+            image_cache_ttl: parse_env_u64("IMAGE_CACHE_TTL", 259200)?,
+            og_cache_ttl: parse_env_u64("OG_CACHE_TTL", 259200)?,
             fetch_timeout_ms: parse_env_u64("FETCH_TIMEOUT_MS", 8000)?,
             api_miss_max_concurrency: parse_env_usize(
                 "API_MISS_MAX_CONCURRENCY",
