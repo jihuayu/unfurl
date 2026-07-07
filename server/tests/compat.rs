@@ -19,7 +19,9 @@ use unfurl_server::{
     cache::CacheStore,
     config::{CacheBackend, Config, ImageCacheBackend},
     image_cache::ImageCacheStore,
-    models::{CacheEnvelope, ImageCacheHit, ImageCacheWrite, UnfurlData},
+    models::{
+        CacheEnvelope, CacheRead, ImageCacheHit, ImageCacheRead, ImageCacheWrite, UnfurlData,
+    },
     router_with_state,
     state::AppState,
 };
@@ -635,10 +637,7 @@ struct NoopMetadataCache;
 
 #[async_trait]
 impl CacheStore for NoopMetadataCache {
-    async fn get(
-        &self,
-        _key: &str,
-    ) -> Result<Option<CacheEnvelope>, unfurl_server::error::AppError> {
+    async fn get(&self, _key: &str) -> Result<Option<CacheRead>, unfurl_server::error::AppError> {
         Ok(None)
     }
 
@@ -664,9 +663,12 @@ impl ImageCacheStore for RedirectImageCache {
         &self,
         _key: &str,
         _object_key: &str,
-    ) -> Result<Option<ImageCacheHit>, unfurl_server::error::AppError> {
-        Ok(Some(ImageCacheHit::Redirect {
-            location: "https://preview.example.com/image-cache/v1/f0/f0.jpg".to_string(),
+    ) -> Result<Option<ImageCacheRead>, unfurl_server::error::AppError> {
+        Ok(Some(ImageCacheRead {
+            hit: ImageCacheHit::Redirect {
+                location: "https://preview.example.com/image-cache/v1/f0/f0.jpg".to_string(),
+            },
+            is_stale: false,
         }))
     }
 

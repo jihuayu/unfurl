@@ -109,6 +109,12 @@ pub struct CacheEnvelope {
     pub ttl: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct CacheRead {
+    pub envelope: CacheEnvelope,
+    pub is_stale: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageRequest {
     pub width: Option<u32>,
@@ -136,6 +142,12 @@ pub struct CachedImage {
 pub enum ImageCacheHit {
     Inline(CachedImage),
     Redirect { location: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageCacheRead {
+    pub hit: ImageCacheHit,
+    pub is_stale: bool,
 }
 
 #[derive(Debug, Clone)]

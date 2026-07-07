@@ -109,10 +109,10 @@ async fn unfurl_inner(
 
     if !force {
         let cache_lookup_started_at = Instant::now();
-        if let Some(envelope) = state.cache.get(&cache_key).await? {
+        if let Some(read) = state.cache.get(&cache_key).await? {
             timings.cache_read_ms = Some(elapsed_ms(cache_lookup_started_at));
             return Ok(success_response(
-                envelope.data,
+                read.envelope.data,
                 CacheStatus::Hit,
                 started_at,
                 state.config.api_response_cache_ttl,
@@ -274,14 +274,14 @@ async fn image_proxy_inner(
     );
 
     let cache_lookup_started_at = Instant::now();
-    if let Some(hit) = state
+    if let Some(read) = state
         .image_cache
         .get(&image_cache_key, &image_object_key)
         .await?
     {
         timings.cache_read_ms = Some(elapsed_ms(cache_lookup_started_at));
         return image_cache_hit_response(
-            hit,
+            read.hit,
             state.config.image_cache_ttl,
             CacheStatus::Hit,
             state.image_cache.label(),

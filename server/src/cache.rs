@@ -11,12 +11,12 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::{
     config::{CacheBackend, Config},
     error::AppError,
-    models::{CacheEnvelope, UnfurlData},
+    models::{CacheEnvelope, CacheRead, UnfurlData},
 };
 
 #[async_trait]
 pub trait CacheStore: Send + Sync {
-    async fn get(&self, key: &str) -> Result<Option<CacheEnvelope>, AppError>;
+    async fn get(&self, key: &str) -> Result<Option<CacheRead>, AppError>;
     async fn set(&self, key: &str, data: &UnfurlData, ttl: u64) -> Result<CacheEnvelope, AppError>;
     fn label(&self) -> &'static str;
 }
@@ -44,7 +44,7 @@ pub struct NoopCache;
 
 #[async_trait]
 impl CacheStore for NoopCache {
-    async fn get(&self, _key: &str) -> Result<Option<CacheEnvelope>, AppError> {
+    async fn get(&self, _key: &str) -> Result<Option<CacheRead>, AppError> {
         Ok(None)
     }
 
@@ -126,7 +126,7 @@ impl SqliteCache {
 
 #[async_trait]
 impl CacheStore for SqliteCache {
-    async fn get(&self, key: &str) -> Result<Option<CacheEnvelope>, AppError> {
+    async fn get(&self, key: &str) -> Result<Option<CacheRead>, AppError> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let row = sqlx::query(
             "SELECT payload_json FROM unfurl_cache WHERE cache_key = ?1 AND expires_at > ?2",
@@ -137,9 +137,10 @@ impl CacheStore for SqliteCache {
         .await?;
 
         match row {
-            Some(row) => Ok(Some(serde_json::from_str(
-                row.try_get::<&str, _>("payload_json")?,
-            )?)),
+            Some(row) => Ok(Some(CacheRead {
+                envelope: serde_json::from_str(row.try_get::<&str, _>("payload_json")?)?,
+                is_stale: false,
+            })),
             None => Ok(None),
         }
     }
@@ -182,11 +183,16 @@ pub struct RedisCache {
 
 #[async_trait]
 impl CacheStore for RedisCache {
-    async fn get(&self, key: &str) -> Result<Option<CacheEnvelope>, AppError> {
+    async fn get(&self, key: &str) -> Result<Option<CacheRead>, AppError> {
         let mut connection = self.client.get_multiplexed_async_connection().await?;
         let value: Option<String> = connection.get(key).await?;
         value
-            .map(|payload| serde_json::from_str(&payload))
+            .map(|payload| {
+                serde_json::from_str(&payload).map(|envelope| CacheRead {
+                    envelope,
+                    is_stale: false,
+                })
+            })
             .transpose()
             .map_err(Into::into)
     }

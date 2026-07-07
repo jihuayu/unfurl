@@ -14,12 +14,12 @@ use time::OffsetDateTime;
 use crate::{
     config::{Config, ImageCacheBackend},
     error::AppError,
-    models::{CachedImage, ImageCacheHit, ImageCacheWrite},
+    models::{CachedImage, ImageCacheHit, ImageCacheRead, ImageCacheWrite},
 };
 
 #[async_trait]
 pub trait ImageCacheStore: Send + Sync {
-    async fn get(&self, key: &str, object_key: &str) -> Result<Option<ImageCacheHit>, AppError>;
+    async fn get(&self, key: &str, object_key: &str) -> Result<Option<ImageCacheRead>, AppError>;
     async fn put(&self, entry: ImageCacheWrite) -> Result<ImageCacheHit, AppError>;
     fn label(&self) -> &'static str;
 }
@@ -43,7 +43,7 @@ pub struct NoopImageCache;
 
 #[async_trait]
 impl ImageCacheStore for NoopImageCache {
-    async fn get(&self, _key: &str, _object_key: &str) -> Result<Option<ImageCacheHit>, AppError> {
+    async fn get(&self, _key: &str, _object_key: &str) -> Result<Option<ImageCacheRead>, AppError> {
         Ok(None)
     }
 
@@ -124,7 +124,7 @@ impl SqliteImageCache {
 
 #[async_trait]
 impl ImageCacheStore for SqliteImageCache {
-    async fn get(&self, key: &str, _object_key: &str) -> Result<Option<ImageCacheHit>, AppError> {
+    async fn get(&self, key: &str, _object_key: &str) -> Result<Option<ImageCacheRead>, AppError> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let row = sqlx::query(
             "SELECT content_type, image_bytes, optimized FROM image_cache WHERE cache_key = ?1 AND expires_at > ?2",
@@ -135,11 +135,14 @@ impl ImageCacheStore for SqliteImageCache {
         .await?;
 
         match row {
-            Some(row) => Ok(Some(ImageCacheHit::Inline(CachedImage {
-                content_type: row.try_get::<&str, _>("content_type")?.to_string(),
-                bytes: Bytes::from(row.try_get::<Vec<u8>, _>("image_bytes")?),
-                optimized: row.try_get::<i64, _>("optimized")? == 1,
-            }))),
+            Some(row) => Ok(Some(ImageCacheRead {
+                hit: ImageCacheHit::Inline(CachedImage {
+                    content_type: row.try_get::<&str, _>("content_type")?.to_string(),
+                    bytes: Bytes::from(row.try_get::<Vec<u8>, _>("image_bytes")?),
+                    optimized: row.try_get::<i64, _>("optimized")? == 1,
+                }),
+                is_stale: false,
+            })),
             None => Ok(None),
         }
     }
@@ -229,7 +232,7 @@ impl S3ImageCache {
 
 #[async_trait]
 impl ImageCacheStore for S3ImageCache {
-    async fn get(&self, _key: &str, object_key: &str) -> Result<Option<ImageCacheHit>, AppError> {
+    async fn get(&self, _key: &str, object_key: &str) -> Result<Option<ImageCacheRead>, AppError> {
         match self
             .client
             .head_object()
@@ -238,8 +241,11 @@ impl ImageCacheStore for S3ImageCache {
             .send()
             .await
         {
-            Ok(_) => Ok(Some(ImageCacheHit::Redirect {
-                location: self.public_url(object_key),
+            Ok(_) => Ok(Some(ImageCacheRead {
+                hit: ImageCacheHit::Redirect {
+                    location: self.public_url(object_key),
+                },
+                is_stale: false,
             })),
             Err(error)
                 if error
