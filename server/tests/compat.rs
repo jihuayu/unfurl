@@ -38,7 +38,8 @@ fn test_config(sqlite_path: PathBuf) -> Config {
         port: 0,
         low_memory_mode: false,
         api_response_cache_ttl: 3600,
-        image_cache_ttl: 86400,
+        image_cache_ttl: 259200,
+        image_browser_cache_ttl: 86400,
         og_cache_ttl: 43200,
         fetch_timeout_ms: 8000,
         api_miss_max_concurrency: 8,
@@ -731,6 +732,13 @@ async fn image_proxy_forces_query_referer_and_caches_processed_image() {
     assert_eq!(
         response.headers().get(header::CACHE_CONTROL).unwrap(),
         "public, max-age=86400, immutable"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("cloudflare-cdn-cache-control")
+            .unwrap(),
+        "public, s-maxage=259200"
     );
     assert!(
         response

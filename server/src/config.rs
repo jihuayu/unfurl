@@ -23,6 +23,7 @@ pub struct Config {
     pub low_memory_mode: bool,
     pub api_response_cache_ttl: u64,
     pub image_cache_ttl: u64,
+    pub image_browser_cache_ttl: u64,
     pub og_cache_ttl: u64,
     pub fetch_timeout_ms: u64,
     pub api_miss_max_concurrency: usize,
@@ -118,6 +119,7 @@ impl Config {
             low_memory_mode,
             api_response_cache_ttl: parse_env_u64("API_RESPONSE_CACHE_TTL", 3600)?,
             image_cache_ttl: parse_env_u64("IMAGE_CACHE_TTL", 259200)?,
+            image_browser_cache_ttl: parse_env_u64("IMAGE_BROWSER_CACHE_TTL", 86400)?,
             og_cache_ttl: parse_env_u64("OG_CACHE_TTL", 259200)?,
             fetch_timeout_ms: parse_env_u64("FETCH_TIMEOUT_MS", 8000)?,
             api_miss_max_concurrency: parse_env_usize(

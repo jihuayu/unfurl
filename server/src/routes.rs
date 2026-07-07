@@ -382,6 +382,7 @@ async fn image_proxy_inner(
         return image_cache_hit_response(
             read.hit,
             state.config.image_cache_ttl,
+            state.config.image_browser_cache_ttl,
             CacheStatus::Hit,
             state.image_cache.label(),
             read.is_stale,
@@ -394,6 +395,7 @@ async fn image_proxy_inner(
     image_cache_hit_response(
         cached,
         state.config.image_cache_ttl,
+        state.config.image_browser_cache_ttl,
         CacheStatus::Miss,
         "origin",
         false,
@@ -585,6 +587,7 @@ async fn fetch_and_store_image(
 fn image_cache_hit_response(
     hit: ImageCacheHit,
     image_cache_ttl: u64,
+    image_browser_cache_ttl: u64,
     cache_status: CacheStatus,
     cache_source: &str,
     is_stale: bool,
@@ -606,13 +609,22 @@ fn image_cache_hit_response(
                 header::CACHE_CONTROL,
                 header::HeaderValue::from_str(&format!(
                     "public, max-age={}, immutable",
-                    image_cache_ttl
+                    image_browser_cache_ttl
                 ))
                 .map_err(|error| {
                     AppError::internal_with_message(format!(
                         "failed to set image cache-control header: {error}"
                     ))
                 })?,
+            );
+            headers.insert(
+                "cloudflare-cdn-cache-control",
+                header::HeaderValue::from_str(&format!("public, s-maxage={image_cache_ttl}"))
+                    .map_err(|error| {
+                        AppError::internal_with_message(format!(
+                            "failed to set image cloudflare cache-control header: {error}"
+                        ))
+                    })?,
             );
             headers.insert(header::VARY, header::HeaderValue::from_static("Accept"));
             headers.insert(
@@ -656,13 +668,22 @@ fn image_cache_hit_response(
                 header::CACHE_CONTROL,
                 header::HeaderValue::from_str(&format!(
                     "public, max-age={}, immutable",
-                    image_cache_ttl
+                    image_browser_cache_ttl
                 ))
                 .map_err(|error| {
                     AppError::internal_with_message(format!(
                         "failed to set redirect cache-control header: {error}"
                     ))
                 })?,
+            );
+            headers.insert(
+                "cloudflare-cdn-cache-control",
+                header::HeaderValue::from_str(&format!("public, s-maxage={image_cache_ttl}"))
+                    .map_err(|error| {
+                        AppError::internal_with_message(format!(
+                            "failed to set redirect cloudflare cache-control header: {error}"
+                        ))
+                    })?,
             );
             headers.insert(
                 "x-cache-status",

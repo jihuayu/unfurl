@@ -64,7 +64,8 @@ Environment variables:
 | `SQLITE_PATH` | `/data/unfurl.db` | SQLite file path |
 | `REDIS_URL` | empty | Required when `CACHE_BACKEND=redis` |
 | `API_RESPONSE_CACHE_TTL` | `3600` | Browser/API JSON cache TTL |
-| `IMAGE_CACHE_TTL` | `259200` | Browser/CDN image cache TTL |
+| `IMAGE_CACHE_TTL` | `259200` | Processed image cache TTL and Cloudflare edge TTL hint |
+| `IMAGE_BROWSER_CACHE_TTL` | `86400` | Browser image cache TTL returned by `/proxy/image` |
 | `OG_CACHE_TTL` | `259200` | Metadata cache TTL |
 | `FETCH_TIMEOUT_MS` | `8000` | Upstream fetch timeout |
 | `API_MISS_MAX_CONCURRENCY` | dynamic | Maximum concurrent `/api` cache misses |
@@ -97,6 +98,7 @@ Cache behavior:
 - when `IMAGE_CACHE_BACKEND=sqlite` or `IMAGE_CACHE_BACKEND=s3`, processed `/proxy/image` output is cached by `IMAGE_CACHE_BACKEND`
 - expired SQLite metadata and image entries are served stale while refresh runs asynchronously
 - metadata fetches start warming the returned image and page icon in the image cache
+- `/proxy/image` returns `Cache-Control` for browsers and `Cloudflare-CDN-Cache-Control` for Cloudflare edge caching
 - image and logo URLs returned by `/api` point at `/proxy/image` and include `referer=<source page url>` so hotlink-protected origins still see the page referer
 - when `IMAGE_CACHE_BACKEND=sqlite`, the server returns cached image bytes directly
 - when `IMAGE_CACHE_BACKEND=s3`, the server uploads processed bytes to S3 and returns `302 Found` to `S3_PUBLIC_BASE_URL/<object-key>`
