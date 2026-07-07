@@ -969,8 +969,8 @@ async fn spawn_server_process(
         .env("IMAGE_CACHE_BACKEND", image_backend.env_value())
         .env("SQLITE_PATH", sqlite_path)
         .env("API_RESPONSE_CACHE_TTL", "3600")
-        .env("IMAGE_CACHE_TTL", "86400")
-        .env("OG_CACHE_TTL", "43200")
+        .env("IMAGE_CACHE_TTL", "259200")
+        .env("OG_CACHE_TTL", "259200")
         .env("FETCH_TIMEOUT_MS", "8000")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
