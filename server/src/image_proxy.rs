@@ -35,32 +35,35 @@ pub fn process_image(
     }
 
     let Some(source_format) = source_format else {
-        return Err(AppError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "UNSUPPORTED_MEDIA_TYPE",
-            "Origin image format cannot be transformed",
-        ));
+        return Ok(original_image(bytes, content_type));
     };
 
-    let mut image = image::load_from_memory(bytes).map_err(|error| {
-        AppError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "UNSUPPORTED_MEDIA_TYPE",
-            format!("Failed to decode image: {error}"),
-        )
-    })?;
+    let Ok(mut image) = image::load_from_memory(bytes) else {
+        return Ok(original_image(bytes, content_type));
+    };
 
     if needs_resize {
         image = transform_image(image, request);
     }
 
     let format = request.format.clone();
-    let encoded = encode_image(image, &format, request.quality)?;
+    let encoded = match encode_image(image, &format, request.quality) {
+        Ok(encoded) => encoded,
+        Err(_) => return Ok(original_image(bytes, content_type)),
+    };
     Ok(ProcessedImage {
         bytes: encoded,
         content_type: content_type_for_format(&format).to_string(),
         optimized: source_format != format || needs_resize,
     })
+}
+
+fn original_image(bytes: &[u8], content_type: &str) -> ProcessedImage {
+    ProcessedImage {
+        bytes: bytes.to_vec(),
+        content_type: content_type.to_string(),
+        optimized: false,
+    }
 }
 
 fn transform_image(image: DynamicImage, request: &ImageRequest) -> DynamicImage {

@@ -752,6 +752,62 @@ async fn image_proxy_forces_query_referer_and_caches_processed_image() {
 }
 
 #[tokio::test]
+async fn image_proxy_returns_original_when_format_cannot_be_transformed() {
+    let upstream = MockServer::start().await;
+    let icon_body = vec![0_u8, 0, 1, 0, 1, 0, 16, 16, 0, 0];
+    let local_target_url = format!("{}/favicon.ico", upstream.uri());
+    let target_url = local_target_url
+        .replace("127.0.0.1", "image.example.test")
+        .replace("localhost", "image.example.test");
+    Mock::given(method("GET"))
+        .and(path("/favicon.ico"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/x-icon")
+                .set_body_bytes(icon_body.clone()),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let app = build_test_app(
+        temp_dir.path().join("cache.db"),
+        "image.example.test",
+        &local_target_url,
+    )
+    .await;
+    let target = urlencoding::encode(&target_url).into_owned();
+    let request = || {
+        Request::builder()
+            .uri(format!("/proxy/image?url={target}"))
+            .header(header::ACCEPT, "image/avif,image/webp,image/*")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let response = app.clone().oneshot(request()).await.unwrap();
+    let headers = response.headers().clone();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+
+    assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "image/x-icon");
+    assert_eq!(headers.get("x-image-optimized").unwrap(), "0");
+    assert_eq!(headers.get("x-cache-status").unwrap(), "MISS");
+    assert_eq!(body.as_ref(), icon_body.as_slice());
+
+    let cached = app.oneshot(request()).await.unwrap();
+    let cached_headers = cached.headers().clone();
+    let cached_body = cached.into_body().collect().await.unwrap().to_bytes();
+
+    assert_eq!(cached_headers.get("x-cache-status").unwrap(), "HIT");
+    assert_eq!(
+        cached_headers.get(header::CONTENT_TYPE).unwrap(),
+        "image/x-icon"
+    );
+    assert_eq!(cached_body.as_ref(), icon_body.as_slice());
+}
+
+#[tokio::test]
 async fn image_proxy_serves_stale_image_and_refreshes_async() {
     let upstream = MockServer::start().await;
     let old_png = sample_png_with_color([255, 0, 0, 255]);
