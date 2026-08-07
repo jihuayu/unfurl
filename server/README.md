@@ -253,6 +253,27 @@ docker run --rm -p 8080:8080 \
   unfurl-server
 ```
 
+### Option 7: Railway
+
+A `railway.toml` config is provided at the repository root for deployment on Railway with SQLite persistence.
+
+Configuration:
+- Build: uses `server/Dockerfile`
+- Healthcheck: `GET /health`
+- Restart policy: `ON_FAILURE` with up to 5 retries
+- Replicas: `1` (recommended for SQLite)
+- Required mount: `/data` for the SQLite database file
+
+Setup steps:
+1. Add the repository to Railway.
+2. In the service settings, set **Root Directory** to `/server` so the build context matches the `server/Dockerfile`.
+3. Set the **Config File Path** to `/railway.toml` so Railway loads the config from the repository root.
+4. Create a Railway volume and mount it at `/data`. The `requiredMountPath` setting enforces this.
+
+The container image defaults to `CACHE_BACKEND=sqlite` and `IMAGE_CACHE_BACKEND=sqlite`, with `SQLITE_PATH=/data/unfurl.db`, so metadata and processed image caches are persisted on the volume.
+
+If you prefer Redis or S3, override `CACHE_BACKEND` and/or `IMAGE_CACHE_BACKEND` in the service variables.
+
 ## Deployment Notes
 
 ### Reverse Proxy
