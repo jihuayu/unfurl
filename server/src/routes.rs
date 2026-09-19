@@ -481,6 +481,9 @@ async fn fetch_and_store_image(
     target: ImageCacheTarget,
     mut timings: Option<&mut RequestTimings>,
 ) -> Result<ImageCacheHit, AppError> {
+    // Metadata warming and stale-cache refresh bypass the public image route.
+    // Validate here as well: literal IPs do not pass through the DNS resolver.
+    let upstream_url = validate_public_url(&target.target_url)?;
     let _miss_permit = state
         .image_miss_limiter
         .clone()
@@ -488,7 +491,7 @@ async fn fetch_and_store_image(
         .await
         .map_err(|_| AppError::internal_with_message("image miss limiter closed"))?;
     let fetch_started_at = Instant::now();
-    let mut request = state.client.get(&target.target_url).header(
+    let mut request = state.client.get(upstream_url).header(
         header::ACCEPT,
         "image/avif,image/webp,image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5",
     );
@@ -740,5 +743,35 @@ fn apply_server_timing_header(response: &mut Response<Body>, timings: &RequestTi
     }
     if let Ok(value) = header::HeaderValue::from_str(&parts.join(", ")) {
         response.headers_mut().insert("server-timing", value);
+    }
+}
+
+#[cfg(test)]
+mod upstream_guard_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    #[tokio::test]
+    async fn background_image_fetch_rejects_private_literals_before_network_io() {
+        let state = AppState {
+            config: crate::config::Config::from_env().unwrap(),
+            client: reqwest::Client::new(),
+            cache: Arc::new(crate::cache::NoopCache),
+            image_cache: Arc::new(crate::image_cache::NoopImageCache),
+            api_miss_limiter: Arc::new(Semaphore::new(1)),
+            image_miss_limiter: Arc::new(Semaphore::new(1)),
+        };
+        for url in [
+            "http://127.0.0.1:1/image.png",
+            "http://[::ffff:127.0.0.1]:1/image.png",
+        ] {
+            let target =
+                build_image_cache_target(&state, url.to_string(), None, metadata_image_request());
+            let error = fetch_and_store_image(&state, target, None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "PRIVATE_IP");
+        }
     }
 }
