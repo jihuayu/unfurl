@@ -320,13 +320,10 @@ pub fn validate_public_url(raw_url: &str) -> Result<Url, AppError> {
 
 fn is_blocked_ip_literal(hostname: &str) -> bool {
     hostname
+        .trim_start_matches('[')
+        .trim_end_matches(']')
         .parse::<IpAddr>()
-        .map(|address| match address {
-            IpAddr::V4(value) => value.is_private() || value.is_loopback() || value.is_link_local(),
-            IpAddr::V6(value) => {
-                value.is_loopback() || value.is_unique_local() || value.is_unicast_link_local()
-            }
-        })
+        .map(|address| !crate::public_network::is_public_ip(address))
         .unwrap_or(false)
 }
 

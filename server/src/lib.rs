@@ -9,6 +9,7 @@ pub mod image_cache;
 pub mod image_proxy;
 pub mod image_worker;
 pub mod models;
+mod public_network;
 pub mod routes;
 pub mod state;
 pub mod telemetry;
@@ -27,7 +28,9 @@ use state::AppState;
 
 pub async fn build_app(config: Config) -> Result<Router, AppError> {
     let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .no_proxy()
+        .dns_resolver(Arc::new(public_network::PublicResolver))
+        .redirect(public_network::redirect_policy())
         .brotli(true)
         .gzip(true)
         .deflate(true)
