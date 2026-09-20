@@ -49,6 +49,7 @@ fn test_config(sqlite_path: PathBuf) -> Config {
         sqlite_meta_max_connections: 5,
         sqlite_image_max_connections: 5,
         sqlite_idle_timeout_secs: 300,
+        database_url: None,
         cache_backend: CacheBackend::Sqlite,
         image_cache_backend: ImageCacheBackend::Sqlite,
         sqlite_path,
@@ -1071,4 +1072,74 @@ impl ImageCacheStore for RedirectImageCache {
     fn label(&self) -> &'static str {
         "s3"
     }
+}
+
+#[tokio::test]
+async fn postgres_cache_preserves_binary_stale_data_and_survives_reconnect() {
+    let base = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    let schema = format!(
+        "unfurl_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut url = url::Url::parse(&base).unwrap();
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let mut config = test_config(PathBuf::new());
+    config.database_url = Some(url.to_string());
+    config.cache_backend = CacheBackend::Postgres;
+    config.image_cache_backend = ImageCacheBackend::Postgres;
+    let cache = unfurl_server::cache::build_cache(&config).await.unwrap();
+    let data: UnfurlData = serde_json::from_value(
+        serde_json::json!({"url":"https://example.com/test", "title":"Unicode 中文"}),
+    )
+    .unwrap();
+    cache.set("test", &data, 0).await.unwrap();
+    drop(cache);
+    let cache = unfurl_server::cache::build_cache(&config).await.unwrap();
+    let result = cache.get("test").await.unwrap().unwrap();
+    assert!(result.is_stale);
+    assert_eq!(result.envelope.data, data);
+    cache.set("test", &data, 3600).await.unwrap();
+    assert!(!cache.get("test").await.unwrap().unwrap().is_stale);
+    let images = unfurl_server::image_cache::build_image_cache(&config)
+        .await
+        .unwrap();
+    images
+        .put(ImageCacheWrite {
+            cache_key: "image".into(),
+            object_key: "image".into(),
+            bytes: vec![0, 255, 1, 0, 128].into(),
+            content_type: "image/png".into(),
+            optimized: true,
+            ttl: 0,
+        })
+        .await
+        .unwrap();
+    drop(images);
+    let images = unfurl_server::image_cache::build_image_cache(&config)
+        .await
+        .unwrap();
+    let result = images.get("image", "image").await.unwrap().unwrap();
+    assert!(result.is_stale);
+    match result.hit {
+        ImageCacheHit::Inline(image) => {
+            assert_eq!(image.bytes.as_ref(), &[0, 255, 1, 0, 128]);
+            assert!(image.optimized);
+        }
+        _ => panic!("expected inline binary cache"),
+    }
+    drop(images);
+    drop(cache);
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

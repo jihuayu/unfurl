@@ -23,6 +23,7 @@ pub trait CacheStore: Send + Sync {
 
 pub async fn build_cache(config: &Config) -> Result<Arc<dyn CacheStore>, AppError> {
     match config.cache_backend {
+        CacheBackend::Postgres => Ok(Arc::new(PostgresCache::new(config).await?)),
         CacheBackend::None => Ok(Arc::new(NoopCache)),
         CacheBackend::Sqlite => Ok(Arc::new(
             SqliteCache::new(
@@ -172,6 +173,97 @@ impl CacheStore for SqliteCache {
 
     fn label(&self) -> &'static str {
         "sqlite"
+    }
+}
+
+pub struct PostgresCache {
+    pool: sqlx::PgPool,
+}
+
+impl PostgresCache {
+    async fn new(config: &Config) -> Result<Self, AppError> {
+        let url = config
+            .database_url
+            .as_deref()
+            .ok_or_else(|| AppError::internal_with_message("DATABASE_URL is required"))?;
+        let options = sqlx::postgres::PgConnectOptions::from_str(url)
+            .map_err(|_| AppError::internal_with_message("invalid PostgreSQL URL"))?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .connect_with(options)
+            .await?;
+        sqlx::query(
+            r#"
+      CREATE TABLE IF NOT EXISTS unfurl_cache (
+        cache_key TEXT PRIMARY KEY,
+        payload_json TEXT NOT NULL,
+        cached_at TEXT NOT NULL,
+        ttl_seconds BIGINT NOT NULL,
+        expires_at BIGINT NOT NULL
+      )
+      "#,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_unfurl_cache_expires_at ON unfurl_cache (expires_at)",
+        )
+        .execute(&pool)
+        .await?;
+
+        Ok(Self { pool })
+    }
+}
+
+#[async_trait]
+impl CacheStore for PostgresCache {
+    async fn get(&self, key: &str) -> Result<Option<CacheRead>, AppError> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let row =
+            sqlx::query("SELECT payload_json, expires_at FROM unfurl_cache WHERE cache_key = $1")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        match row {
+            Some(row) => Ok(Some(CacheRead {
+                envelope: serde_json::from_str(row.try_get::<&str, _>("payload_json")?)?,
+                is_stale: row.try_get::<i64, _>("expires_at")? <= now,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    async fn set(&self, key: &str, data: &UnfurlData, ttl: u64) -> Result<CacheEnvelope, AppError> {
+        let envelope = build_envelope(data.clone(), ttl)?;
+        let payload = serde_json::to_string(&envelope)?;
+        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + ttl as i64;
+
+        sqlx::query(
+            r#"
+      INSERT INTO unfurl_cache (cache_key, payload_json, cached_at, ttl_seconds, expires_at)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT(cache_key) DO UPDATE SET
+        payload_json = excluded.payload_json,
+        cached_at = excluded.cached_at,
+        ttl_seconds = excluded.ttl_seconds,
+        expires_at = excluded.expires_at
+      "#,
+        )
+        .bind(key)
+        .bind(&payload)
+        .bind(&envelope.cached_at)
+        .bind(ttl as i64)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(envelope)
+    }
+
+    fn label(&self) -> &'static str {
+        "postgres"
     }
 }
 

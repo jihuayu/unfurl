@@ -26,6 +26,7 @@ pub trait ImageCacheStore: Send + Sync {
 
 pub async fn build_image_cache(config: &Config) -> Result<Arc<dyn ImageCacheStore>, AppError> {
     match config.image_cache_backend {
+        ImageCacheBackend::Postgres => Ok(Arc::new(PostgresImageCache::new(config).await?)),
         ImageCacheBackend::None => Ok(Arc::new(NoopImageCache)),
         ImageCacheBackend::Sqlite => Ok(Arc::new(
             SqliteImageCache::new(
@@ -176,6 +177,103 @@ impl ImageCacheStore for SqliteImageCache {
 
     fn label(&self) -> &'static str {
         "sqlite"
+    }
+}
+
+pub struct PostgresImageCache {
+    pool: sqlx::PgPool,
+}
+
+impl PostgresImageCache {
+    async fn new(config: &Config) -> Result<Self, AppError> {
+        let url = config
+            .database_url
+            .as_deref()
+            .ok_or_else(|| AppError::internal_with_message("DATABASE_URL is required"))?;
+        let options = sqlx::postgres::PgConnectOptions::from_str(url)
+            .map_err(|_| AppError::internal_with_message("invalid PostgreSQL URL"))?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .connect_with(options)
+            .await?;
+        sqlx::query(
+            r#"
+      CREATE TABLE IF NOT EXISTS image_cache (
+        cache_key TEXT PRIMARY KEY,
+        content_type TEXT NOT NULL,
+        image_bytes BYTEA NOT NULL,
+        optimized BIGINT NOT NULL,
+        expires_at BIGINT NOT NULL
+      )
+      "#,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_image_cache_expires_at ON image_cache (expires_at)",
+        )
+        .execute(&pool)
+        .await?;
+
+        Ok(Self { pool })
+    }
+}
+
+#[async_trait]
+impl ImageCacheStore for PostgresImageCache {
+    async fn get(&self, key: &str, _object_key: &str) -> Result<Option<ImageCacheRead>, AppError> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let row = sqlx::query(
+            "SELECT content_type, image_bytes, optimized, expires_at FROM image_cache WHERE cache_key = $1",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => Ok(Some(ImageCacheRead {
+                hit: ImageCacheHit::Inline(CachedImage {
+                    content_type: row.try_get::<&str, _>("content_type")?.to_string(),
+                    bytes: Bytes::from(row.try_get::<Vec<u8>, _>("image_bytes")?),
+                    optimized: row.try_get::<i64, _>("optimized")? == 1,
+                }),
+                is_stale: row.try_get::<i64, _>("expires_at")? <= now,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    async fn put(&self, entry: ImageCacheWrite) -> Result<ImageCacheHit, AppError> {
+        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + entry.ttl as i64;
+        sqlx::query(
+            r#"
+      INSERT INTO image_cache (cache_key, content_type, image_bytes, optimized, expires_at)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT(cache_key) DO UPDATE SET
+        content_type = excluded.content_type,
+        image_bytes = excluded.image_bytes,
+        optimized = excluded.optimized,
+        expires_at = excluded.expires_at
+      "#,
+        )
+        .bind(&entry.cache_key)
+        .bind(&entry.content_type)
+        .bind(entry.bytes.as_ref())
+        .bind(if entry.optimized { 1_i64 } else { 0_i64 })
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(ImageCacheHit::Inline(CachedImage {
+            bytes: entry.bytes,
+            content_type: entry.content_type,
+            optimized: entry.optimized,
+        }))
+    }
+
+    fn label(&self) -> &'static str {
+        "postgres"
     }
 }
 

@@ -6,6 +6,7 @@ use crate::error::AppError;
 pub enum CacheBackend {
     None,
     Sqlite,
+    Postgres,
     Redis,
 }
 
@@ -13,6 +14,7 @@ pub enum CacheBackend {
 pub enum ImageCacheBackend {
     None,
     Sqlite,
+    Postgres,
     S3,
 }
 
@@ -36,6 +38,7 @@ pub struct Config {
     pub cache_backend: CacheBackend,
     pub image_cache_backend: ImageCacheBackend,
     pub sqlite_path: PathBuf,
+    pub database_url: Option<String>,
     pub image_worker_bin: Option<PathBuf>,
     pub redis_url: Option<String>,
     pub s3_endpoint: Option<String>,
@@ -58,12 +61,15 @@ impl Config {
         {
             "none" | "off" | "disabled" => CacheBackend::None,
             "sqlite" => CacheBackend::Sqlite,
+            "postgres" => CacheBackend::Postgres,
             "redis" => CacheBackend::Redis,
             other => {
                 return Err(AppError::new(
                     axum::http::StatusCode::BAD_REQUEST,
                     "INVALID_CACHE_BACKEND",
-                    format!("Unsupported cache backend: {other}; expected none, sqlite, or redis"),
+                    format!(
+                        "Unsupported cache backend: {other}; expected none, sqlite, postgres, or redis"
+                    ),
                 ));
             }
         };
@@ -74,18 +80,32 @@ impl Config {
         {
             "none" | "off" | "disabled" => ImageCacheBackend::None,
             "sqlite" => ImageCacheBackend::Sqlite,
+            "postgres" => ImageCacheBackend::Postgres,
             "s3" => ImageCacheBackend::S3,
             other => {
                 return Err(AppError::new(
                     axum::http::StatusCode::BAD_REQUEST,
                     "INVALID_IMAGE_CACHE_BACKEND",
                     format!(
-                        "Unsupported image cache backend: {other}; expected none, sqlite, or s3"
+                        "Unsupported image cache backend: {other}; expected none, sqlite, postgres, or s3"
                     ),
                 ));
             }
         };
 
+        let database_url = env::var("DATABASE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        if (cache_backend == CacheBackend::Postgres
+            || image_cache_backend == ImageCacheBackend::Postgres)
+            && database_url.is_none()
+        {
+            return Err(AppError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "MISSING_CONFIG",
+                "DATABASE_URL is required for PostgreSQL caches",
+            ));
+        }
         let redis_url = env::var("REDIS_URL")
             .ok()
             .filter(|value| !value.trim().is_empty());
@@ -152,6 +172,7 @@ impl Config {
             )?,
             cache_backend,
             image_cache_backend,
+            database_url,
             sqlite_path: PathBuf::from(
                 env::var("SQLITE_PATH").unwrap_or_else(|_| "/data/unfurl.db".to_string()),
             ),
