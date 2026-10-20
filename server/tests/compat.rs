@@ -36,6 +36,7 @@ fn test_config(sqlite_path: PathBuf) -> Config {
     Config {
         host: "127.0.0.1".to_string(),
         port: 0,
+        public_base_url: None,
         low_memory_mode: false,
         api_response_cache_ttl: 3600,
         image_cache_ttl: 259200,
@@ -49,6 +50,7 @@ fn test_config(sqlite_path: PathBuf) -> Config {
         sqlite_meta_max_connections: 5,
         sqlite_image_max_connections: 5,
         sqlite_idle_timeout_secs: 300,
+        database_url: None,
         cache_backend: CacheBackend::Sqlite,
         image_cache_backend: ImageCacheBackend::Sqlite,
         sqlite_path,
@@ -73,6 +75,7 @@ async fn build_test_app(
     let url = url::Url::parse(target).unwrap();
     let port = url.port_or_known_default().unwrap();
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::limited(10))
         .resolve(resolved_host, SocketAddr::from(([127, 0, 0, 1], port)))
         .build()
@@ -102,6 +105,51 @@ fn sample_html(image_url: &str) -> String {
   </body>
 </html>"#
     )
+}
+
+#[tokio::test]
+async fn failed_image_worker_serves_and_caches_original_image() {
+    let upstream = MockServer::start().await;
+    let png = sample_png();
+    Mock::given(method("GET"))
+        .and(path("/original.png"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(png.clone(), "image/png"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let directory = TempDir::new().unwrap();
+    let mut config = test_config(directory.path().join("cache.db"));
+    config.low_memory_mode = true;
+    config.image_worker_bin = Some(directory.path().join("missing-worker"));
+    let target = upstream.uri().replace("127.0.0.1", "mock.example.test");
+    let port = url::Url::parse(&upstream.uri()).unwrap().port().unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve(
+            "mock.example.test",
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        )
+        .build()
+        .unwrap();
+    let app = build_app_with_client(config, client).await.unwrap();
+    let uri = format!(
+        "/proxy/image?url={}&f=avif",
+        urlencoding::encode(&format!("{target}/original.png"))
+    );
+    for expected in ["MISS", "HIT"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(response.headers()["x-cache-status"], expected);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            png.as_slice()
+        );
+    }
 }
 
 fn sqlite_url(path: &Path) -> String {
@@ -277,7 +325,7 @@ async fn api_returns_metadata_then_hits_cache() {
         .oneshot(
             Request::builder()
                 .uri(format!("/api?url={url}"))
-                .header(header::HOST, "service.example")
+                .header(header::HOST, "another.example")
                 .header("x-forwarded-proto", "https")
                 .body(Body::empty())
                 .unwrap(),
@@ -301,6 +349,12 @@ async fn api_returns_metadata_then_hits_cache() {
             .contains("cache-read")
     );
     assert_eq!(second_json["data"]["title"], "Example Title");
+    assert!(
+        second_json["data"]["image"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://another.example/proxy/image?")
+    );
 }
 
 #[tokio::test]
@@ -412,10 +466,14 @@ async fn api_serves_stale_metadata_and_refreshes_async() {
         .await;
     Mock::given(method("GET"))
         .and(path("/page"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            "<!doctype html><html><head><title>New Title</title></head></html>",
-            "text/html; charset=utf-8",
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(200))
+                .set_body_raw(
+                    "<!doctype html><html><head><title>New Title</title></head></html>",
+                    "text/html; charset=utf-8",
+                ),
+        )
         .expect(1)
         .mount(&upstream)
         .await;
@@ -438,15 +496,25 @@ async fn api_serves_stale_metadata_and_refreshes_async() {
     assert_eq!(first.status(), StatusCode::OK);
     expire_cache_table(&sqlite_path, "unfurl_cache").await;
 
-    let stale = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api?url={url}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let mut requests = Vec::new();
+    for _ in 0..100 {
+        let app = app.clone();
+        let url = url.clone();
+        requests.push(tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .uri(format!("/api?url={url}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }));
+    }
+    let stale = requests.remove(0).await.unwrap();
+    for request in requests {
+        assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+    }
     let stale_headers = stale.headers().clone();
     let stale_body = stale.into_body().collect().await.unwrap().to_bytes();
     let stale_json: serde_json::Value = serde_json::from_slice(&stale_body).unwrap();
@@ -528,6 +596,7 @@ async fn api_none_cache_backend_always_misses() {
     config.cache_backend = CacheBackend::None;
     let url = url::Url::parse(&local_page_url).unwrap();
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::limited(10))
         .resolve(
             "mock.example.test",
@@ -760,7 +829,7 @@ async fn image_proxy_forces_query_referer_and_caches_processed_image() {
 }
 
 #[tokio::test]
-async fn image_proxy_returns_original_when_format_cannot_be_transformed() {
+async fn image_proxy_rejects_unknown_formats_instead_of_caching_originals() {
     let upstream = MockServer::start().await;
     let icon_body = vec![0_u8, 0, 1, 0, 1, 0, 16, 16, 0, 0];
     let local_target_url = format!("{}/favicon.ico", upstream.uri());
@@ -794,25 +863,12 @@ async fn image_proxy_returns_original_when_format_cannot_be_transformed() {
             .unwrap()
     };
 
-    let response = app.clone().oneshot(request()).await.unwrap();
-    let headers = response.headers().clone();
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-
-    assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "image/x-icon");
-    assert_eq!(headers.get("x-image-optimized").unwrap(), "0");
-    assert_eq!(headers.get("x-cache-status").unwrap(), "MISS");
-    assert_eq!(body.as_ref(), icon_body.as_slice());
-
-    let cached = app.oneshot(request()).await.unwrap();
-    let cached_headers = cached.headers().clone();
-    let cached_body = cached.into_body().collect().await.unwrap().to_bytes();
-
-    assert_eq!(cached_headers.get("x-cache-status").unwrap(), "HIT");
+    let response = app.oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(
-        cached_headers.get(header::CONTENT_TYPE).unwrap(),
-        "image/x-icon"
+        image_cache_row_count(&temp_dir.path().join("cache.db")).await,
+        0
     );
-    assert_eq!(cached_body.as_ref(), icon_body.as_slice());
 }
 
 #[tokio::test]
@@ -900,6 +956,7 @@ async fn image_proxy_none_cache_backend_always_misses() {
     config.image_cache_backend = ImageCacheBackend::None;
     let url = url::Url::parse(&local_target_url).unwrap();
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::limited(10))
         .resolve(
             "image.example.test",
@@ -981,6 +1038,7 @@ async fn image_proxy_uses_external_worker_in_low_memory_mode() {
     config.image_worker_bin = Some(PathBuf::from(env!("CARGO_BIN_EXE_image_worker")));
     let url = url::Url::parse(&local_target_url).unwrap();
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::limited(10))
         .resolve(
             "image.example.test",
@@ -1071,4 +1129,254 @@ impl ImageCacheStore for RedirectImageCache {
     fn label(&self) -> &'static str {
         "s3"
     }
+}
+
+#[tokio::test]
+async fn postgres_cache_preserves_binary_stale_data_and_survives_reconnect() {
+    let base = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    let schema = format!(
+        "unfurl_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut url = url::Url::parse(&base).unwrap();
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let mut config = test_config(PathBuf::new());
+    config.database_url = Some(url.to_string());
+    config.cache_backend = CacheBackend::Postgres;
+    config.image_cache_backend = ImageCacheBackend::Postgres;
+    let cache = unfurl_server::cache::build_cache(&config).await.unwrap();
+    let data: UnfurlData = serde_json::from_value(
+        serde_json::json!({"url":"https://example.com/test", "title":"Unicode 中文"}),
+    )
+    .unwrap();
+    cache.set("test", &data, 0).await.unwrap();
+    drop(cache);
+    let cache = unfurl_server::cache::build_cache(&config).await.unwrap();
+    let result = cache.get("test").await.unwrap().unwrap();
+    assert!(result.is_stale);
+    assert_eq!(result.envelope.data, data);
+    cache.set("test", &data, 3600).await.unwrap();
+    assert!(!cache.get("test").await.unwrap().unwrap().is_stale);
+    let images = unfurl_server::image_cache::build_image_cache(&config)
+        .await
+        .unwrap();
+    images
+        .put(ImageCacheWrite {
+            cache_key: "image".into(),
+            object_key: "image".into(),
+            bytes: vec![0, 255, 1, 0, 128].into(),
+            content_type: "image/png".into(),
+            optimized: true,
+            ttl: 0,
+        })
+        .await
+        .unwrap();
+    drop(images);
+    let images = unfurl_server::image_cache::build_image_cache(&config)
+        .await
+        .unwrap();
+    let result = images.get("image", "image").await.unwrap().unwrap();
+    assert!(result.is_stale);
+    match result.hit {
+        ImageCacheHit::Inline(image) => {
+            assert_eq!(image.bytes.as_ref(), &[0, 255, 1, 0, 128]);
+            assert!(image.optimized);
+        }
+        _ => panic!("expected inline binary cache"),
+    }
+    let scoped = sqlx::PgPool::connect(config.database_url.as_deref().unwrap())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO unfurl_cache(cache_key,payload_json,cached_at,ttl_seconds,expires_at,last_access) SELECT 'cold-'||n,payload_json,cached_at,ttl_seconds,expires_at,0 FROM generate_series(1,10001) n CROSS JOIN (SELECT * FROM unfurl_cache WHERE cache_key='test') seed").execute(&scoped).await.unwrap();
+    sqlx::query("INSERT INTO image_cache(cache_key,content_type,image_bytes,optimized,expires_at,last_access) SELECT 'cold-'||n,content_type,image_bytes,optimized,expires_at,0 FROM generate_series(1,10001) n CROSS JOIN (SELECT * FROM image_cache WHERE cache_key='image') seed").execute(&scoped).await.unwrap();
+    cache.get("test").await.unwrap();
+    images.get("image", "image").await.unwrap();
+    let mut workers = Vec::new();
+    for index in 0..16 {
+        let cache = cache.clone();
+        let images = images.clone();
+        let data = data.clone();
+        workers.push(tokio::spawn(async move {
+            cache
+                .set(&format!("new-{index}"), &data, 3600)
+                .await
+                .unwrap();
+            images
+                .put(ImageCacheWrite {
+                    cache_key: format!("new-{index}"),
+                    object_key: String::new(),
+                    bytes: vec![1, 2, 3].into(),
+                    content_type: "image/png".into(),
+                    optimized: false,
+                    ttl: 3600,
+                })
+                .await
+                .unwrap();
+        }));
+    }
+    for worker in workers {
+        worker.await.unwrap();
+    }
+    let metadata_count: i64 = sqlx::query_scalar("SELECT count(*) FROM unfurl_cache")
+        .fetch_one(&scoped)
+        .await
+        .unwrap();
+    let image_count: i64 = sqlx::query_scalar("SELECT count(*) FROM image_cache")
+        .fetch_one(&scoped)
+        .await
+        .unwrap();
+    assert_eq!(metadata_count, 10000);
+    assert_eq!(image_count, 10000);
+    assert!(cache.get("test").await.unwrap().is_some());
+    assert!(images.get("image", "image").await.unwrap().is_some());
+    // Highly compressible TOAST fixtures exercise the real logical-byte budgets
+    // without allocating half a GiB of physical disk in the test cluster.
+    sqlx::query("INSERT INTO unfurl_cache(cache_key,payload_json,cached_at,ttl_seconds,expires_at,last_access) SELECT 'large-'||n,jsonb_set(payload_json::jsonb,'{data,description}',to_jsonb(repeat('x',1048576)))::text,cached_at,ttl_seconds,expires_at,0 FROM generate_series(1,65) n CROSS JOIN (SELECT * FROM unfurl_cache WHERE cache_key='test') seed").execute(&scoped).await.unwrap();
+    sqlx::query("INSERT INTO image_cache(cache_key,content_type,image_bytes,optimized,expires_at,last_access) SELECT 'large-'||n,'image/png',convert_to(repeat('x',16777216),'UTF8'),0,expires_at,0 FROM generate_series(1,33) n CROSS JOIN (SELECT * FROM image_cache WHERE cache_key='image') seed").execute(&scoped).await.unwrap();
+    cache.set("test", &data, 3600).await.unwrap();
+    images
+        .put(ImageCacheWrite {
+            cache_key: "image".into(),
+            object_key: String::new(),
+            bytes: vec![1, 2, 3].into(),
+            content_type: "image/png".into(),
+            optimized: false,
+            ttl: 3600,
+        })
+        .await
+        .unwrap();
+    let metadata_bytes: i64 =
+        sqlx::query_scalar("SELECT sum(octet_length(payload_json))::bigint FROM unfurl_cache")
+            .fetch_one(&scoped)
+            .await
+            .unwrap();
+    let image_bytes: i64 =
+        sqlx::query_scalar("SELECT sum(octet_length(image_bytes))::bigint FROM image_cache")
+            .fetch_one(&scoped)
+            .await
+            .unwrap();
+    assert!(metadata_bytes <= 64 * 1024 * 1024);
+    assert!(image_bytes <= 512 * 1024 * 1024);
+    sqlx::query("UPDATE unfurl_cache SET expires_at=0 WHERE cache_key='test'")
+        .execute(&scoped)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE image_cache SET expires_at=0 WHERE cache_key='image'")
+        .execute(&scoped)
+        .await
+        .unwrap();
+    cache.set("trigger", &data, 3600).await.unwrap();
+    images
+        .put(ImageCacheWrite {
+            cache_key: "trigger".into(),
+            object_key: String::new(),
+            bytes: vec![1].into(),
+            content_type: "image/png".into(),
+            optimized: false,
+            ttl: 3600,
+        })
+        .await
+        .unwrap();
+    assert!(cache.get("test").await.unwrap().is_none());
+    assert!(images.get("image", "image").await.unwrap().is_none());
+    scoped.close().await;
+    drop(images);
+    drop(cache);
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_cold_requests_share_one_origin_fetch() {
+    let upstream = MockServer::start().await;
+    let local = format!("{}/coalesced", upstream.uri());
+    let target = local.replace("127.0.0.1", "mock.example.test");
+    Mock::given(method("GET"))
+        .and(path("/coalesced"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(100))
+                .set_body_raw(
+                    "<html><head><title>shared</title></head></html>",
+                    "text/html",
+                ),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let directory = TempDir::new().unwrap();
+    let app = build_test_app(
+        directory.path().join("cache.db"),
+        "mock.example.test",
+        &local,
+    )
+    .await;
+    let mut tasks = Vec::new();
+    for _ in 0..100 {
+        let app = app.clone();
+        let uri = format!("/api?url={}", urlencoding::encode(&target));
+        tasks.push(tokio::spawn(async move {
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }));
+    }
+    for task in tasks {
+        assert_eq!(task.await.unwrap().status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn failed_helper_never_caches_mislabeled_svg() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/evil.png"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<svg xmlns='http://www.w3.org/2000/svg'><script>void 0</script></svg>",
+            "image/png",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("cache.db");
+    let mut config = test_config(database.clone());
+    config.low_memory_mode = true;
+    config.image_worker_bin = Some(directory.path().join("missing-worker"));
+    let target = upstream.uri().replace("127.0.0.1", "mock.example.test");
+    let port = url::Url::parse(&upstream.uri()).unwrap().port().unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve(
+            "mock.example.test",
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        )
+        .build()
+        .unwrap();
+    let app = build_app_with_client(config, client).await.unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/proxy/image?url={}",
+                    urlencoding::encode(&format!("{target}/evil.png"))
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(image_cache_row_count(&database).await, 0);
 }

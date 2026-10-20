@@ -392,7 +392,11 @@ fn selected_memory_modes_from_env() -> Result<Vec<MemoryMode>, BenchError> {
     };
 
     let mut modes = Vec::new();
-    for item in raw.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+    for item in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
         let mode = MemoryMode::parse(item)
             .ok_or_else(|| format!("invalid LIFECYCLE_MEMORY_MODES item `{item}`"))?;
         if !modes.contains(&mode) {
@@ -480,8 +484,7 @@ async fn run_lifecycle_for_mode(
         mode.label(),
         IDLE_REQUEST_INTERVAL.as_secs()
     );
-    let phase4 =
-        run_idle_phase(server_pid, client.clone(), &base_url, prev_peak_memory_mb).await?;
+    let phase4 = run_idle_phase(server_pid, client.clone(), &base_url, prev_peak_memory_mb).await?;
     print_phase_summary(&phase4, mode);
     if let Some(ref mr) = phase4.memory_release {
         println!(
@@ -917,9 +920,7 @@ async fn prewarm_cache(
                 .await
                 .map_err(|e| -> BenchError { Box::new(e) })?;
             if resp.status() != StatusCode::OK {
-                return Err(
-                    format!("prewarm failed for id={id}: status={}", resp.status()).into(),
-                );
+                return Err(format!("prewarm failed for id={id}: status={}", resp.status()).into());
             }
             Ok::<(), BenchError>(())
         });

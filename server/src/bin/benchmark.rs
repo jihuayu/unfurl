@@ -538,7 +538,12 @@ fn parse_image_backend_item(value: &str) -> Result<ImageBackendKind, BenchError>
 fn parse_env_bool(name: &str, default_value: bool) -> bool {
     std::env::var(name)
         .ok()
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
         .unwrap_or(default_value)
 }
 
