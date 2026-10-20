@@ -316,7 +316,7 @@ async fn run_orchestrator() -> Result<(), BenchError> {
     let report = BenchmarkReport {
         generated_at: time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)?,
-        note: "CPU and memory are sampled from the unfurl server process only. S3 scenarios exclude MinIO resource usage from the server resource stats.",
+        note: "CPU and memory are sampled from the unfurl server process only. S3 scenarios exclude RustFS resource usage from the server resource stats.",
         scenarios,
     };
 
@@ -803,6 +803,7 @@ fn image_target_url(id: usize) -> String {
 
 fn benchmark_client() -> Result<reqwest::Client, BenchError> {
     Ok(reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()?)
 }
@@ -1047,6 +1048,7 @@ async fn run_server_process(args: &[String]) -> Result<(), BenchError> {
 
     let config = Config::from_env()?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::limited(10))
         .resolve(MOCK_HOST, SocketAddr::from(([127, 0, 0, 1], mock_port)))
         .build()?;
@@ -1196,6 +1198,37 @@ async fn ensure_bucket_public(config: &BenchmarkS3Config) -> Result<(), BenchErr
         .put_bucket_policy()
         .bucket(&config.bucket)
         .policy(policy)
+        .send()
+        .await?;
+
+    // Validate the fixture's actual S3 write and anonymous-read contract before
+    // timing requests. A redirect alone cannot prove that its target is readable.
+    let probe_key = format!("{}/fixture-check.txt", config.prefix.trim_matches('/'));
+    let probe = b"unfurl-rustfs-fixture";
+    client
+        .put_object()
+        .bucket(&config.bucket)
+        .key(&probe_key)
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(probe))
+        .send()
+        .await?;
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()?
+        .get(format!(
+            "{}/{}",
+            config.public_base_url.trim_end_matches('/'),
+            probe_key
+        ))
+        .send()
+        .await?;
+    if response.status() != StatusCode::OK || response.bytes().await?.as_ref() != probe {
+        return Err("S3 fixture did not preserve public-read object bytes".into());
+    }
+    client
+        .delete_object()
+        .bucket(&config.bucket)
+        .key(&probe_key)
         .send()
         .await?;
 
