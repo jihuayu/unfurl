@@ -1,5 +1,13 @@
 # Unfurl Server
 
+## 图片处理恢复说明
+
+低内存模式的图片子进程在超时、管道写入阻塞或请求取消时会被终止，避免后台进程
+继续占用容器内存。子进程处理失败时返回并缓存原图，保留正确的原始 Content-Type。
+代理下载限制为 16 MiB；超过 1600 万像素的图像和超过 400 万像素的 AVIF 转码请求
+保留原图，不执行高内存解码或编码。处理排队也受超时限制，繁忙时返回明确的 429。
+因此请求的格式及尺寸在资源不足时可能退回原图，正文图片仍可正常显示。
+
 A standalone Rust server for unfurling URL metadata.
 
 It exposes these public routes:
@@ -76,13 +84,14 @@ Environment variables:
 | `SQLITE_IMAGE_MAX_CONNECTIONS` | dynamic | Maximum SQLite connections for image cache |
 | `SQLITE_IDLE_TIMEOUT_SECS` | dynamic | Idle timeout for SQLite pooled connections |
 | `IMAGE_WORKER_BIN` | sibling binary | Optional explicit path to the external image worker binary |
-| `S3_ENDPOINT` | empty | Optional custom S3 endpoint, useful for MinIO/R2-compatible gateways |
+| `S3_ENDPOINT` | empty | Optional custom S3 endpoint, useful for RustFS/R2-compatible gateways |
 | `S3_REGION` | `us-east-1` | S3 region |
 | `S3_BUCKET` | empty | Required when `IMAGE_CACHE_BACKEND=s3` |
 | `S3_ACCESS_KEY_ID` | empty | Optional static access key |
 | `S3_SECRET_ACCESS_KEY` | empty | Optional static secret |
 | `S3_PUBLIC_BASE_URL` | empty | Required when `IMAGE_CACHE_BACKEND=s3`, used for `302` redirect target |
-| `S3_FORCE_PATH_STYLE` | `false` | Enable path-style addressing for MinIO or compatible services |
+| `PUBLIC_BASE_URL` | 空 | 可信公共 HTTP(S) origin，不能包含凭据、路径、查询或片段。生产环境应固定配置；缓存保留原始元数据，返回时按本次入口生成代理地址 |
+| `S3_FORCE_PATH_STYLE` | `false` | Enable path-style addressing for RustFS or compatible services |
 | `S3_PREFIX` | `image-cache` | Object key prefix for processed image cache |
 | `OTEL_SERVICE_NAME` | `unfurl-server` | OTLP service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | empty | Enable OTLP export when set |
@@ -455,3 +464,26 @@ The server keeps these public API guarantees:
 4. Add external rate limiting if the service is public.
 5. Export traces to an OTLP collector.
 6. Monitor upstream fetch failures and image transform errors.
+
+
+## 资源预算与公共入口
+
+上游 HTML 解压后的实际响应最多 8 MiB，图片输入最多 32 MiB；即使没有 `Content-Length` 或使用压缩传输也按实际读取字节判断。图片解码维度最多 16384，解码分配预算为 128 MiB，变换中间图与输出画布最多 16 Mi 像素。超限请求返回 413。
+
+图片子进程的输入写入、输出读取和退出等待共用 `FETCH_TIMEOUT_MS` 截止时间（子进程预算下限为 1000 ms）；超时会终止并回收子进程，输出也有独立大小上限。部署时设置 `PUBLIC_BASE_URL`，避免依赖反向代理传来的入口头。旧版改写缓存使用不同键，防止混用。
+
+
+### 缓存生命周期与响应安全
+
+SQLite/PostgreSQL 缓存写入与回收在同一事务内完成。元数据最多 10,000 条、64 MiB 正文，图片最多 10,000 条、512 MiB 二进制；优先保留最近访问记录，并保留最多七天的过期宽限用于后台刷新。预算为逻辑数据量，不含数据库索引、WAL 等开销；SQLite 删除后的页由后续写入复用，不在请求路径执行阻塞式全库 VACUUM。部署仍应监控数据库文件和磁盘剩余空间。Redis/S3 的物理容量由部署侧生命周期规则管理。
+
+同进程同键后台刷新只保留一个任务，冷请求取得键锁后重新检查缓存，失败或取消会释放锁。该协调范围是单实例，不应把多副本扩容理解为已有分布式抓取租约。
+
+图片代理只接受 MIME 与魔数相符的 PNG、JPEG、WebP、GIF、AVIF。SVG、未知格式和伪装成图片的活动文档一律拒绝；低内存外部 helper 的失败回退前及持久化前均验证原始字节。已有内联缓存也执行同样检查，并设置 nosniff 与 sandbox CSP。图片键升级到 v2，避免复用旧版未经验证的内联/S3 对象；旧 S3 对象仍按部署侧生命周期策略清理。
+
+
+### RustFS S3 基准环境
+
+CI 使用官方 [RustFS 1.0.3](https://github.com/rustfs/rustfs/releases/tag/1.0.3) 镜像，固定 OCI 摘要 `sha256:9ca9559533b537d10482fe923288b676ad08f92a7069d9a17327fbae3cab688b`，不使用 `latest`。遵循[官方容器文档](https://docs.rustfs.com/en/installation/container/docker)，通过 `RUSTFS_ACCESS_KEY`、`RUSTFS_SECRET_KEY` 设置一次性测试凭据；S3 仅映射宿主回环端口 9000，关闭 Console，并用 `/health/ready` 等待存储与 IAM 就绪。数据使用全新临时卷，任务结束删除，不连接或迁移生产存储。
+
+基准启动时通过 AWS SDK 创建独立测试桶并设置仅对象匿名读取策略，然后执行对象 PUT、匿名 GET 字节一致性检查和 DELETE，成功后才运行原有 SQLite/S3 性能矩阵。这些固定测试凭据不得用于实际部署；生产请另行配置凭据、网络隔离和数据备份。本变更没有修改生产 S3 接口或删除已有数据。

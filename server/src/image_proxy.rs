@@ -2,7 +2,7 @@ use std::io::Cursor;
 
 use axum::http::StatusCode;
 use image::{
-    DynamicImage, GenericImageView, ImageEncoder,
+    DynamicImage, GenericImageView, ImageEncoder, ImageReader, Limits,
     codecs::{avif::AvifEncoder, jpeg::JpegEncoder, png::PngEncoder, webp::WebPEncoder},
     imageops::{self, FilterType},
 };
@@ -18,6 +18,13 @@ pub fn process_image(
     content_type: &str,
     request: &ImageRequest,
 ) -> Result<ProcessedImage, AppError> {
+    validate_raster(bytes, content_type)?;
+    if bytes.len() > 32 * 1024 * 1024
+        || request.width.is_some_and(|v| v == 0 || v > 16_384)
+        || request.height.is_some_and(|v| v == 0 || v > 16_384)
+    {
+        return Err(resource_limit());
+    }
     let source_format = image_format_from_content_type(content_type);
     let needs_resize = request.width.is_some() || request.height.is_some();
     let needs_reencode =
@@ -38,11 +45,33 @@ pub fn process_image(
         return Ok(original_image(bytes, content_type));
     };
 
-    let Ok(mut image) = image::load_from_memory(bytes) else {
+    let Ok(mut reader) = ImageReader::new(Cursor::new(bytes)).with_guessed_format() else {
         return Ok(original_image(bytes, content_type));
+    };
+    let dimensions = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok());
+    if let Some((width, height)) = dimensions {
+        let pixels = u64::from(width) * u64::from(height);
+        // 保留生产环境的大图回退，同时继续约束解码分配和缩放中间尺寸。
+        if pixels > 16_000_000 || (request.format == ImageFormat::Avif && pixels > 4_000_000) {
+            return Ok(original_image(bytes, content_type));
+        }
+    }
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let mut image = match reader.decode() {
+        Ok(image) => image,
+        Err(image::ImageError::Limits(_)) => return Err(resource_limit()),
+        Err(_) => return Ok(original_image(bytes, content_type)),
     };
 
     if needs_resize {
+        check_transform_budget(image.width(), image.height(), request)?;
         image = transform_image(image, request);
     }
 
@@ -56,6 +85,88 @@ pub fn process_image(
         content_type: content_type_for_format(&format).to_string(),
         optimized: source_format != format || needs_resize,
     })
+}
+
+pub fn validate_raster(bytes: &[u8], content_type: &str) -> Result<(), AppError> {
+    let expected = match content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" => Some(image::ImageFormat::Png),
+        "image/jpeg" | "image/jpg" => Some(image::ImageFormat::Jpeg),
+        "image/webp" => Some(image::ImageFormat::WebP),
+        "image/gif" => Some(image::ImageFormat::Gif),
+        "image/avif" => Some(image::ImageFormat::Avif),
+        _ => None,
+    };
+    if expected.is_none() || image::guess_format(bytes).ok() != expected {
+        return Err(AppError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "UNSUPPORTED_MEDIA_TYPE",
+            "Only verified raster image payloads are allowed",
+        ));
+    }
+    Ok(())
+}
+
+fn resource_limit() -> AppError {
+    AppError::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "IMAGE_RESOURCE_LIMIT",
+        "Image dimensions or processing allocation exceed the limit",
+    )
+}
+
+fn check_transform_budget(width: u32, height: u32, request: &ImageRequest) -> Result<(), AppError> {
+    let cover = matches!(request.fit, ImageFit::Cover | ImageFit::Crop);
+    let scale_down = matches!(request.fit, ImageFit::ScaleDown);
+    let target = resize_dimensions(
+        width,
+        height,
+        request.width,
+        request.height,
+        cover,
+        scale_down,
+    );
+    for (w, h) in target.into_iter().chain(request.width.zip(request.height)) {
+        if w > 16_384 || h > 16_384 || u64::from(w) * u64::from(h) > 16 * 1024 * 1024 {
+            return Err(resource_limit());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn extreme_aspect_ratio_cannot_allocate_a_giant_cover_intermediate() {
+        let request = ImageRequest {
+            width: Some(4096),
+            height: Some(4096),
+            quality: 80,
+            format: ImageFormat::Png,
+            fit: ImageFit::Cover,
+        };
+        assert!(check_transform_budget(1, 16000, &request).is_err());
+        assert!(
+            check_transform_budget(
+                800,
+                600,
+                &ImageRequest {
+                    width: Some(400),
+                    height: Some(300),
+                    ..request
+                }
+            )
+            .is_ok()
+        );
+    }
 }
 
 fn original_image(bytes: &[u8], content_type: &str) -> ProcessedImage {

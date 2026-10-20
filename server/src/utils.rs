@@ -320,13 +320,10 @@ pub fn validate_public_url(raw_url: &str) -> Result<Url, AppError> {
 
 fn is_blocked_ip_literal(hostname: &str) -> bool {
     hostname
+        .trim_start_matches('[')
+        .trim_end_matches(']')
         .parse::<IpAddr>()
-        .map(|address| match address {
-            IpAddr::V4(value) => value.is_private() || value.is_loopback() || value.is_link_local(),
-            IpAddr::V6(value) => {
-                value.is_loopback() || value.is_unique_local() || value.is_unicast_link_local()
-            }
-        })
+        .map(|address| !crate::public_network::is_public_ip(address))
         .unwrap_or(false)
 }
 
@@ -377,7 +374,7 @@ fn normalize_pathname(pathname: &str) -> String {
 }
 
 pub fn build_unfurl_cache_key(raw_url: &str) -> Result<String, AppError> {
-    Ok(format!("unfurl:v1:{}", normalize_target_url(raw_url)?))
+    Ok(format!("unfurl:v2:{}", normalize_target_url(raw_url)?))
 }
 
 pub fn choose_image_format(
@@ -400,7 +397,16 @@ pub fn choose_image_format(
 
 pub fn ensure_image_content_type(content_type: Option<&str>) -> Result<&str, AppError> {
     let content_type = content_type.unwrap_or_default();
-    if !content_type.to_ascii_lowercase().starts_with("image/") {
+    if !matches!(
+        content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "image/png" | "image/jpeg" | "image/jpg" | "image/webp" | "image/gif" | "image/avif"
+    ) {
         return Err(AppError::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "UNSUPPORTED_MEDIA_TYPE",
@@ -447,7 +453,7 @@ pub fn build_processed_image_cache_key(
     request: &ImageRequest,
 ) -> String {
     let raw = format!(
-        "image:v1|url={target_url}|referer={}|w={}|h={}|q={}|fit={}|format={}",
+        "image:v2|url={target_url}|referer={}|w={}|h={}|q={}|fit={}|format={}",
         referer.unwrap_or_default(),
         request
             .width
@@ -462,7 +468,7 @@ pub fn build_processed_image_cache_key(
         image_format_slug(&request.format),
     );
     let digest = Sha256::digest(raw.as_bytes());
-    format!("image:v1:{digest:x}")
+    format!("image:v2:{digest:x}")
 }
 
 pub fn build_processed_image_object_key(
@@ -488,7 +494,10 @@ pub fn image_extension_for_format(format: &ImageFormat) -> &'static str {
     }
 }
 
-pub fn request_origin(headers: &HeaderMap) -> String {
+pub fn request_origin(headers: &HeaderMap, configured: Option<&str>) -> String {
+    if let Some(origin) = configured {
+        return origin.to_string();
+    }
     let host = headers
         .get("x-forwarded-host")
         .or_else(|| headers.get(header::HOST))

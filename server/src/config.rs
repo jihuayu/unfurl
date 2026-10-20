@@ -6,6 +6,7 @@ use crate::error::AppError;
 pub enum CacheBackend {
     None,
     Sqlite,
+    Postgres,
     Redis,
 }
 
@@ -13,6 +14,7 @@ pub enum CacheBackend {
 pub enum ImageCacheBackend {
     None,
     Sqlite,
+    Postgres,
     S3,
 }
 
@@ -20,6 +22,7 @@ pub enum ImageCacheBackend {
 pub struct Config {
     pub host: String,
     pub port: u16,
+    pub public_base_url: Option<String>,
     pub low_memory_mode: bool,
     pub api_response_cache_ttl: u64,
     pub image_cache_ttl: u64,
@@ -36,6 +39,7 @@ pub struct Config {
     pub cache_backend: CacheBackend,
     pub image_cache_backend: ImageCacheBackend,
     pub sqlite_path: PathBuf,
+    pub database_url: Option<String>,
     pub image_worker_bin: Option<PathBuf>,
     pub redis_url: Option<String>,
     pub s3_endpoint: Option<String>,
@@ -58,12 +62,15 @@ impl Config {
         {
             "none" | "off" | "disabled" => CacheBackend::None,
             "sqlite" => CacheBackend::Sqlite,
+            "postgres" => CacheBackend::Postgres,
             "redis" => CacheBackend::Redis,
             other => {
                 return Err(AppError::new(
                     axum::http::StatusCode::BAD_REQUEST,
                     "INVALID_CACHE_BACKEND",
-                    format!("Unsupported cache backend: {other}; expected none, sqlite, or redis"),
+                    format!(
+                        "Unsupported cache backend: {other}; expected none, sqlite, postgres, or redis"
+                    ),
                 ));
             }
         };
@@ -74,18 +81,32 @@ impl Config {
         {
             "none" | "off" | "disabled" => ImageCacheBackend::None,
             "sqlite" => ImageCacheBackend::Sqlite,
+            "postgres" => ImageCacheBackend::Postgres,
             "s3" => ImageCacheBackend::S3,
             other => {
                 return Err(AppError::new(
                     axum::http::StatusCode::BAD_REQUEST,
                     "INVALID_IMAGE_CACHE_BACKEND",
                     format!(
-                        "Unsupported image cache backend: {other}; expected none, sqlite, or s3"
+                        "Unsupported image cache backend: {other}; expected none, sqlite, postgres, or s3"
                     ),
                 ));
             }
         };
 
+        let database_url = env::var("DATABASE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        if (cache_backend == CacheBackend::Postgres
+            || image_cache_backend == ImageCacheBackend::Postgres)
+            && database_url.is_none()
+        {
+            return Err(AppError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "MISSING_CONFIG",
+                "DATABASE_URL is required for PostgreSQL caches",
+            ));
+        }
         let redis_url = env::var("REDIS_URL")
             .ok()
             .filter(|value| !value.trim().is_empty());
@@ -116,6 +137,7 @@ impl Config {
         Ok(Self {
             host: env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             port: parse_env_u16("PORT", 8080)?,
+            public_base_url: parse_public_origin(env::var("PUBLIC_BASE_URL").ok())?,
             low_memory_mode,
             api_response_cache_ttl: parse_env_u64("API_RESPONSE_CACHE_TTL", 3600)?,
             image_cache_ttl: parse_env_u64("IMAGE_CACHE_TTL", 259200)?,
@@ -152,6 +174,7 @@ impl Config {
             )?,
             cache_backend,
             image_cache_backend,
+            database_url,
             sqlite_path: PathBuf::from(
                 env::var("SQLITE_PATH").unwrap_or_else(|_| "/data/unfurl.db".to_string()),
             ),
@@ -278,4 +301,51 @@ fn default_sqlite_image_max_connections(low_memory_mode: bool) -> u32 {
 
 fn default_sqlite_idle_timeout_secs(low_memory_mode: bool) -> u64 {
     if low_memory_mode { 15 } else { 300 }
+}
+
+fn parse_public_origin(value: Option<String>) -> Result<Option<String>, AppError> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let url = url::Url::parse(&value).map_err(|_| public_origin_error())?;
+    if value.chars().any(char::is_control)
+        || !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err(public_origin_error());
+    }
+    Ok(Some(url.origin().ascii_serialization()))
+}
+fn public_origin_error() -> AppError {
+    AppError::new(
+        axum::http::StatusCode::BAD_REQUEST,
+        "INVALID_CONFIG",
+        "PUBLIC_BASE_URL must be an HTTP(S) origin without credentials, path, query or fragment",
+    )
+}
+#[cfg(test)]
+mod public_origin_tests {
+    use super::*;
+    #[test]
+    fn validates_and_normalizes_public_origin() {
+        assert_eq!(
+            parse_public_origin(Some("https://Example.com:443/".into())).unwrap(),
+            Some("https://example.com".into())
+        );
+        for value in [
+            "https://user:secret@example.com",
+            "https://example.com/api",
+            "https://example.com?q=x",
+            "https://example.com/#x",
+            "file:///tmp/site",
+            "https://exam\nple.com",
+        ] {
+            assert!(parse_public_origin(Some(value.into())).is_err(), "{value}");
+        }
+    }
 }

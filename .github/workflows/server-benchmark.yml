@@ -145,8 +145,8 @@ jobs:
       BENCH_S3_ENDPOINT: http://127.0.0.1:9000
       BENCH_S3_REGION: us-east-1
       BENCH_S3_BUCKET: unfurl-benchmark
-      BENCH_S3_ACCESS_KEY_ID: minioadmin
-      BENCH_S3_SECRET_ACCESS_KEY: minioadmin
+      BENCH_S3_ACCESS_KEY_ID: unfurl-ci-access
+      BENCH_S3_SECRET_ACCESS_KEY: unfurl-ci-ephemeral-secret
       BENCH_S3_PUBLIC_BASE_URL: http://127.0.0.1:9000/unfurl-benchmark
       BENCH_S3_FORCE_PATH_STYLE: "true"
       BENCH_S3_PREFIX: gha-${{ matrix.artifact_suffix }}
@@ -164,27 +164,35 @@ jobs:
         shell: bash
         run: chmod +x server/target/release/benchmark server/target/release/lifecycle_bench server/target/release/image_worker
 
-      - name: Start MinIO container
+      - name: Start pinned RustFS fixture
         shell: bash
         run: |
-          docker run -d \
-            --name benchmark-minio \
-            -p 9000:9000 \
-            -p 9001:9001 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data --console-address ":9001"
+          # Official RustFS 1.0.3, source 331fb896285a7686f927baf8d9d4dc2d3d3a10a9.
+          # https://docs.rustfs.com/en/installation/container/docker
+          docker run -d --name benchmark-rustfs \
+            -p 127.0.0.1:9000:9000 \
+            --mount type=volume,source=benchmark-rustfs-data,target=/data \
+            -e RUSTFS_ACCESS_KEY="$BENCH_S3_ACCESS_KEY_ID" \
+            -e RUSTFS_SECRET_KEY="$BENCH_S3_SECRET_ACCESS_KEY" \
+            -e RUSTFS_ADDRESS=:9000 \
+            -e RUSTFS_CONSOLE_ENABLE=false \
+            -e RUSTFS_HEALTH_ENDPOINT_ENABLE=true \
+            -e RUSTFS_OBS_LOGGER_LEVEL=warn \
+            -e RUSTFS_OBS_LOG_DIRECTORY= \
+            rustfs/rustfs:1.0.3@sha256:9ca9559533b537d10482fe923288b676ad08f92a7069d9a17327fbae3cab688b \
+            server --region us-east-1 /data
 
-      - name: Wait for MinIO
+      - name: Wait for RustFS readiness
         shell: bash
         run: |
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null; then
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:9000/health/ready >/dev/null; then
               exit 0
             fi
             sleep 2
           done
-          echo "MinIO did not become healthy in time" >&2
+          docker logs benchmark-rustfs >&2
+          echo "RustFS storage and IAM did not become ready in time" >&2
           exit 1
 
       - name: Run server benchmark shard
@@ -198,10 +206,25 @@ jobs:
           path: |
             server/benchmark-results.json
 
-      - name: Stop MinIO container
+      - name: Capture RustFS diagnostics
+        if: failure()
+        shell: bash
+        run: docker logs benchmark-rustfs > "$RUNNER_TEMP/rustfs.log" 2>&1 || true
+
+      - name: Upload RustFS diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustfs-log-${{ matrix.artifact_suffix }}
+          path: ${{ runner.temp }}/rustfs.log
+          if-no-files-found: ignore
+
+      - name: Stop isolated RustFS fixture
         if: always()
         shell: bash
-        run: docker rm -f benchmark-minio || true
+        run: |
+          docker rm -f benchmark-rustfs || true
+          docker volume rm benchmark-rustfs-data || true
 
   aggregate:
     needs: benchmark

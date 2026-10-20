@@ -26,6 +26,7 @@ pub trait ImageCacheStore: Send + Sync {
 
 pub async fn build_image_cache(config: &Config) -> Result<Arc<dyn ImageCacheStore>, AppError> {
     match config.image_cache_backend {
+        ImageCacheBackend::Postgres => Ok(Arc::new(PostgresImageCache::new(config).await?)),
         ImageCacheBackend::None => Ok(Arc::new(NoopImageCache)),
         ImageCacheBackend::Sqlite => Ok(Arc::new(
             SqliteImageCache::new(
@@ -118,6 +119,7 @@ impl SqliteImageCache {
         .execute(&pool)
         .await?;
 
+        crate::cache::ensure_sqlite_access_column(&pool, "image_cache").await?;
         Ok(Self { pool })
     }
 }
@@ -132,6 +134,14 @@ impl ImageCacheStore for SqliteImageCache {
         .bind(key)
         .fetch_optional(&self.pool)
         .await?;
+
+        if row.is_some() {
+            sqlx::query("UPDATE image_cache SET last_access=?1 WHERE cache_key=?2")
+                .bind(now)
+                .bind(key)
+                .execute(&self.pool)
+                .await?;
+        }
 
         match row {
             Some(row) => Ok(Some(ImageCacheRead {
@@ -148,6 +158,7 @@ impl ImageCacheStore for SqliteImageCache {
 
     async fn put(&self, entry: ImageCacheWrite) -> Result<ImageCacheHit, AppError> {
         let expires_at = OffsetDateTime::now_utc().unix_timestamp() + entry.ttl as i64;
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
       INSERT INTO image_cache (cache_key, content_type, image_bytes, optimized, expires_at)
@@ -164,8 +175,19 @@ impl ImageCacheStore for SqliteImageCache {
         .bind(entry.bytes.as_ref())
         .bind(if entry.optimized { 1_i64 } else { 0_i64 })
         .bind(expires_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        sqlx::query("UPDATE image_cache SET last_access=?1 WHERE cache_key=?2")
+            .bind(now)
+            .bind(&entry.cache_key)
+            .execute(&mut *tx)
+            .await?;
+        // Keep a seven-day stale window, with hard logical byte and entry budgets.
+        sqlx::query("DELETE FROM image_cache WHERE expires_at < ?1 OR cache_key IN (SELECT cache_key FROM (SELECT cache_key, ROW_NUMBER() OVER (ORDER BY last_access DESC, cache_key) AS rank, SUM(length(image_bytes)) OVER (ORDER BY last_access DESC, cache_key) AS bytes FROM image_cache) AS ranked WHERE rank > 10000 OR bytes > 536870912)")
+            .bind(now - 7 * 24 * 3600).execute(&mut *tx).await?;
+        tx.commit().await?;
 
         Ok(ImageCacheHit::Inline(CachedImage {
             bytes: entry.bytes,
@@ -176,6 +198,127 @@ impl ImageCacheStore for SqliteImageCache {
 
     fn label(&self) -> &'static str {
         "sqlite"
+    }
+}
+
+pub struct PostgresImageCache {
+    pool: sqlx::PgPool,
+}
+
+impl PostgresImageCache {
+    async fn new(config: &Config) -> Result<Self, AppError> {
+        let url = config
+            .database_url
+            .as_deref()
+            .ok_or_else(|| AppError::internal_with_message("DATABASE_URL is required"))?;
+        let options = sqlx::postgres::PgConnectOptions::from_str(url)
+            .map_err(|_| AppError::internal_with_message("invalid PostgreSQL URL"))?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .connect_with(options)
+            .await?;
+        sqlx::query(
+            r#"
+      CREATE TABLE IF NOT EXISTS image_cache (
+        cache_key TEXT PRIMARY KEY,
+        content_type TEXT NOT NULL,
+        image_bytes BYTEA NOT NULL,
+        optimized BIGINT NOT NULL,
+        expires_at BIGINT NOT NULL
+      )
+      "#,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_image_cache_expires_at ON image_cache (expires_at)",
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query("ALTER TABLE image_cache ADD COLUMN IF NOT EXISTS last_access BIGINT NOT NULL DEFAULT 0").execute(&pool).await?;
+        Ok(Self { pool })
+    }
+}
+
+#[async_trait]
+impl ImageCacheStore for PostgresImageCache {
+    async fn get(&self, key: &str, _object_key: &str) -> Result<Option<ImageCacheRead>, AppError> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let row = sqlx::query(
+            "SELECT content_type, image_bytes, optimized, expires_at FROM image_cache WHERE cache_key = $1",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if row.is_some() {
+            sqlx::query("UPDATE image_cache SET last_access=$1 WHERE cache_key=$2")
+                .bind(now)
+                .bind(key)
+                .execute(&self.pool)
+                .await?;
+        }
+
+        match row {
+            Some(row) => Ok(Some(ImageCacheRead {
+                hit: ImageCacheHit::Inline(CachedImage {
+                    content_type: row.try_get::<&str, _>("content_type")?.to_string(),
+                    bytes: Bytes::from(row.try_get::<Vec<u8>, _>("image_bytes")?),
+                    optimized: row.try_get::<i64, _>("optimized")? == 1,
+                }),
+                is_stale: row.try_get::<i64, _>("expires_at")? <= now,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    async fn put(&self, entry: ImageCacheWrite) -> Result<ImageCacheHit, AppError> {
+        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + entry.ttl as i64;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(742302)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r#"
+      INSERT INTO image_cache (cache_key, content_type, image_bytes, optimized, expires_at)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT(cache_key) DO UPDATE SET
+        content_type = excluded.content_type,
+        image_bytes = excluded.image_bytes,
+        optimized = excluded.optimized,
+        expires_at = excluded.expires_at
+      "#,
+        )
+        .bind(&entry.cache_key)
+        .bind(&entry.content_type)
+        .bind(entry.bytes.as_ref())
+        .bind(if entry.optimized { 1_i64 } else { 0_i64 })
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        sqlx::query("UPDATE image_cache SET last_access=$1 WHERE cache_key=$2")
+            .bind(now)
+            .bind(&entry.cache_key)
+            .execute(&mut *tx)
+            .await?;
+        // Keep a seven-day stale window, with hard logical byte and entry budgets.
+        sqlx::query("DELETE FROM image_cache WHERE expires_at < $1 OR cache_key IN (SELECT cache_key FROM (SELECT cache_key, ROW_NUMBER() OVER (ORDER BY last_access DESC, cache_key) AS rank, SUM(octet_length(image_bytes)) OVER (ORDER BY last_access DESC, cache_key) AS bytes FROM image_cache) AS ranked WHERE rank > 10000 OR bytes > 536870912)")
+            .bind(now - 7 * 24 * 3600).execute(&mut *tx).await?;
+        tx.commit().await?;
+
+        Ok(ImageCacheHit::Inline(CachedImage {
+            bytes: entry.bytes,
+            content_type: entry.content_type,
+            optimized: entry.optimized,
+        }))
+    }
+
+    fn label(&self) -> &'static str {
+        "postgres"
     }
 }
 
@@ -282,5 +425,52 @@ impl ImageCacheStore for S3ImageCache {
 
     fn label(&self) -> &'static str {
         "s3"
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sqlite_image_budget_preserves_hot_entries_and_stale_grace() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = SqliteImageCache::new(&directory.path().join("images.sqlite"), 1, 60)
+            .await
+            .unwrap();
+        let entry = |key: &str| ImageCacheWrite {
+            cache_key: key.into(),
+            object_key: key.into(),
+            bytes: vec![1, 2, 3].into(),
+            content_type: "image/png".into(),
+            optimized: false,
+            ttl: 3600,
+        };
+        cache.put(entry("hot")).await.unwrap();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        sqlx::query("WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 10001) INSERT INTO image_cache(cache_key,content_type,image_bytes,optimized,expires_at,last_access) SELECT 'cold-' || n,'image/png',X'010203',0,?1,0 FROM seq")
+            .bind(now + 3600).execute(&cache.pool).await.unwrap();
+        cache.get("hot", "hot").await.unwrap();
+        cache.put(entry("new")).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM image_cache")
+            .fetch_one(&cache.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 10000);
+        assert!(cache.get("hot", "hot").await.unwrap().is_some());
+        sqlx::query("UPDATE image_cache SET expires_at=?1 WHERE cache_key='hot'")
+            .bind(now - 60)
+            .execute(&cache.pool)
+            .await
+            .unwrap();
+        cache.put(entry("trigger")).await.unwrap();
+        assert!(cache.get("hot", "hot").await.unwrap().unwrap().is_stale);
+        sqlx::query("UPDATE image_cache SET expires_at=?1 WHERE cache_key='hot'")
+            .bind(now - 8 * 24 * 3600)
+            .execute(&cache.pool)
+            .await
+            .unwrap();
+        cache.put(entry("trigger")).await.unwrap();
+        assert!(cache.get("hot", "hot").await.unwrap().is_none());
     }
 }
